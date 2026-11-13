@@ -1,0 +1,44 @@
+{
+  "image": "images/reference_1.png",
+  "thresholds": {
+    "shadow": 17.647058486938477,
+    "highlight": 55.29412078857422
+  },
+  "contrast": {
+    "rms": 18.732465744018555,
+    "percentile": 58.823527336120605,
+    "highlight_shadow_gap": 51.363582611083984
+  },
+  "regions": [
+    {
+      "region": "shadow",
+      "ratio": 0.20353153935185186,
+      "mean_lightness": 9.835150718688965,
+      "std_lightness": 3.9763898849487305,
+      "mean_r": 29.945255578223072,
+      "mean_g": 25.55418227526579,
+      "mean_b": 23.970852496072673,
+      "mean_saturation": 20.016401290893555
+    },
+    {
+      "region": "midtone",
+      "ratio": 0.5959042245370371,
+      "mean_lightness": 40.073516845703125,
+      "std_lightness": 10.735316276550293,
+      "mean_r": 83.90338497345968,
+      "mean_g": 92.58043934976008,
+      "mean_b": 101.74939304035796,
+      "mean_saturation": 46.87495803833008
+    },
+    {
+      "region": "highlight",
+      "ratio": 0.2005642361111111,
+      "mean_lightness": 61.198734283447266,
+      "std_lightness": 5.941435813903809,
+      "mean_r": 137.01441366707542,
+      "mean_g": 150.2198153357859,
+      "mean_b": 143.8214341532617,
+      "mean_saturation": 23.256813049316406
+    }
+  ]
+}
