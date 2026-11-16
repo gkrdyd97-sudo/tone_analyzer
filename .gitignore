@@ -41,4 +41,6 @@ notebooks/
 images/
 *.cube
 
+# AI coding assistant skills (local symlinks into .venv)
 .claude/
+.agents/

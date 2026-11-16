@@ -11,16 +11,18 @@ import numpy as np
 import streamlit as st
 
 
-# 프로젝트 루트 경로
+# 앱 폴더 경로 (src/tone_analyzer) ─ 업로드/결과 저장 위치 기준
 
 PROJECT_ROOT = Path(
     __file__
 ).resolve().parent
 
 
-# src 폴더 경로
+# src 폴더 경로 (src/tone_analyzer 의 부모)
+# 패키지를 설치하지 않고 pip / Streamlit Cloud 로 실행해도
+# `import tone_analyzer` 가 동작하도록 sys.path 에 추가한다.
 
-SRC_PATH = PROJECT_ROOT / "src"
+SRC_PATH = PROJECT_ROOT.parent
 
 
 # src를 Python 모듈 검색 경로에 추가
