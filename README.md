@@ -5,13 +5,16 @@ Reference 이미지의 톤과 색감을 Target 이미지에 옮기고, 그 변�
 컬러리스트의 작업 순서를 그대로 따릅니다.
 
 ```text
-① 프라이머리 (Lift / Gamma / Gain + Contrast / Pivot)
+① Lift / Gamma / Gain
         ↓
-② 색 단계 (톤 영역별 색 전이)
+② Contrast / Pivot                    ─▶ 노드 1 LUT
         ↓
-③ 피부톤 보호 · 강도 조절
+③ 화이트밸런스 (Temp / Tint)           ─▶ 노드 2 LUT
         ↓
-.cube 내보내기 (톤+색 / 톤만 / 색만)
+④ 컬러 그레이딩 (톤 영역별 색 전이)
+   + 피부톤 보호 · 강도 조절            ─▶ 노드 3 LUT
+        ↓
+.cube 내보내기 (전체 하나 / 노드별 3개)
 ```
 
 ---
@@ -37,9 +40,9 @@ uv run streamlit run src/tone_analyzer/app.py
 
 | DaVinci 에서의 사용 방식 | 받을 파일 |
 |---|---|
-| LUT 하나로 끝내기 | **톤 + 색** (`..._{N}_sXXX_skinYYY.cube`) |
-| 노드를 나눠 단계별로 조절 | 노드 1: **톤만** (`_tone`), 노드 2: **색만** (`_color`) |
-| 프라이머리는 휠로 직접 맞추기 | **색만** (`_color`) — 앱의 프라이머리 추정값에 가깝게 맞춘 뒤 사용 |
+| LUT 하나로 끝내기 | **전체 ①~④** (`..._{N}_sXXX_skinYYY.cube`) |
+| 노드를 나눠 단계별로 조절 | 노드 1 `_1_primaries` → 노드 2 `_2_wb` → 노드 3 `_3_color` (차례로 건 결과 = 앱 결과) |
+| ①~③은 휠로 직접 맞추기 | **노드 3** `_3_color` 만 — 앱의 추정값에 가깝게 맞춘 뒤 사용 |
 
 > ⚠️ **색공간 주의**: LUT는 Rec.709 디스플레이 이미지(JPG/PNG/스크린샷) 기준으로 만들어집니다.
 > S-Log, LogC 등 로그 소스에는 먼저 CST/변환 LUT로 Rec.709 로 바꾼 **다음 노드**에 거세요.
@@ -50,34 +53,40 @@ uv run streamlit run src/tone_analyzer/app.py
 
 ## 처리 과정
 
-### 1. 톤 단계 — 프라이머리 추정 (`primaries.py`)
+### ①② Lift / Gamma / Gain → Contrast / Pivot (`primaries.py`)
 
-Target 에 적용할 프라이머리 값을 최적화(`scipy.optimize.least_squares`)로 찾습니다.
-
-| 맞추는 항목 | 결정되는 것 |
-|---|---|
-| 루마 분위수 (1, 5, 10, 25, 50, 75, 90, 95, 99%) | 블랙 레벨, 대비, 중간톤 밝기, 화이트 레벨 |
-| 섀도우 / 미드 / 하이라이트의 **중성색(저채도 픽셀)** 밸런스 | RGB 채널별 Lift / Gamma / Gain 차이 (색온도·틴트) |
-
-적용 순서와 수식 (값 범위 0~1, Rec.709 루마 기준):
+**밝기 계조만** 다룹니다. 루마 분위수(1, 5, 10, 25, 50, 75, 90, 95, 99%)를 Reference 에 맞추는 값을 최적화(`scipy.optimize.least_squares`)로 찾습니다. RGB 세 채널에 같은 값을 쓰는 **마스터 휠**에 해당합니다.
 
 ```text
-1. Contrast / Pivot : y = (x - pivot) * contrast + pivot     (RGB 공통, pivot = Target 루마 중앙값)
-2. Lift   (RGB별)   : y = y + lift * (1 - y)                 (흰색 고정, 검정 이동)
-3. Gain   (RGB별)   : y = y * gain                           (검정 고정, 흰색 이동)
-4. Gamma  (RGB별)   : y = y ** (1 / gamma)                   (지수. 1 = 변화 없음, < 1 이면 중간톤이 어두워짐)
+① Lift   : y = x + lift * (1 - x)          흰색 고정, 검정 이동
+   Gain  : y = y * gain                    검정 고정, 흰색 이동
+   Gamma : y = y ** (1 / gamma)            지수. 1 = 변화 없음, < 1 이면 중간톤이 어두워짐
+② Contrast / Pivot : y = (y - pivot) * contrast + pivot     (pivot = Reference 루마 중앙값)
 ```
 
-- 밸런스는 **회색이어야 할 픽셀**만 보고 판단하므로, Reference 의 빨간 옷 같은 피사체 색에 끌려가지 않습니다.
-- R/G/B 값이 과하게 벌어지지 않도록 채널 간 차이에 벌점을 줍니다. 밸런스는 가볍게, 룩의 색감은 다음 색 단계가 담당합니다.
-- `프라이머리 밸런스 강도`(기본 0.5)로 밸런스를 얼마나 Reference 쪽으로 옮길지 정합니다. 0 이면 밝기·대비만 맞춥니다.
-- 앱에서 추정값 표, 채널별 전달 곡선, 전/후 루마 분위수 그래프를 볼 수 있습니다.
-
-> **DaVinci 수식과의 차이**: Resolve 내부 수식은 공개되어 있지 않아 표준 LGG 공식 기준의 **근사값**입니다. 휠에 옮겨 넣을 때는 시작점으로 쓰고 눈으로 미세 조정하세요. 특히 Gamma 는 지수 값이라 Resolve 휠 숫자와 단위가 다릅니다.
+- **계조 간격 유지 벌점**: 이웃한 분위수 간격이 원래 간격의 40% 보다 좁아지지 않게 해서 블랙 크러시 / 화이트 클리핑을 막습니다.
+- 값이 허용 범위 끝에 닿으면 앱에 경고가 표시됩니다. (두 이미지의 노출 차이가 매우 클 때)
+- 앱에서 추정값 표, 전달 곡선, 전/후 루마 분위수 그래프를 볼 수 있습니다.
 
 이전 방식인 **히스토그램 매칭 커브**(Lab L 채널, 101포인트)도 `톤 단계 방식`에서 선택할 수 있습니다. 분포를 그대로 복사하므로 더 강하게 맞지만, 장면 내용 차이까지 커브에 반영되어 부자연스러울 수 있습니다.
 
-### 2. 색 단계 — 분포 기반 색 전이 (`color_matching.py`)
+### ③ 화이트밸런스 (`white_balance.py`)
+
+①② 를 적용한 이미지에서 **원래 회색이어야 할 픽셀**(루마 20~95%, 상대 채도 하위 20%)의 Lab a·b 중앙값을 Reference 쪽으로 옮기는 Temp / Tint 를 찾습니다.
+
+```text
+gain_R = exp(+temp),  gain_G = exp(-tint),  gain_B = exp(-temp)
+gains  = gains / luma(gains)        # 밝기 유지
+temp > 0 : 따뜻하게,  tint > 0 : 마젠타 쪽
+```
+
+- 회색 계열 픽셀만 보므로 Reference 의 빨간 옷 같은 피사체 색에 끌려가지 않습니다.
+- `③ 화이트밸런스 강도`(기본 0.5): Reference 의 중성색에는 룩의 색감(예: 틸 그레이딩)이 섞여 있을 수 있어 절반만 옮기고, 나머지 룩은 ④ 가 담당합니다.
+- Temp / Tint 는 이 앱의 단위입니다(DaVinci 의 K 값과 다름). DaVinci 에는 함께 표시되는 **RGB Gain 비율**로 옮기는 것이 정확합니다.
+
+> **DaVinci 수식과의 차이**: Resolve 내부 수식은 공개되어 있지 않아 ①~③ 값은 표준 공식 기준의 **근사값**입니다. 휠에 옮겨 넣을 때는 시작점으로 쓰고 눈으로 미세 조정하세요. LUT 는 근사가 아니라 앱 결과 그대로입니다.
+
+### ④ 컬러 그레이딩 — 분포 기반 색 전이 (`color_matching.py`)
 
 Reference 와 Target 은 **서로 다른 사진**이므로 같은 좌표의 픽셀끼리는 아무 관계가 없습니다. 그래서 다음과 같이 학습 데이터를 만듭니다.
 
@@ -102,7 +111,7 @@ Reference 픽셀 샘플링 ┘
 
 `밝기는 1D 톤 커브 유지`(기본 켜짐)를 켜면 밝기는 톤 단계 결과를 유지하고 색(Lab a, b)만 옮깁니다.
 
-### 3. 피부톤 보호 · 강도 (`lut.py`)
+### 피부톤 보호 · 강도 (`lut.py`)
 
 두 기능 모두 **학습이 아니라 LUT 격자점에 직접** 적용되므로 `.cube` 에 그대로 반영되고, 앱에서 실시간으로 조절됩니다.
 
@@ -113,9 +122,10 @@ Reference 픽셀 샘플링 ┘
 |---|---|---|---|---|
 | 피부 영역 평균 ΔE (강도 0.8, 예시 이미지) | 14.9 | 5.9 | 2.2 | 0.1 |
 
-### 4. LUT 합성과 내보내기
+### LUT 합성과 내보내기
 
-- **톤 + 색** LUT 는 각 격자점에 톤 단계를 적용한 뒤 색 LUT 를 삼선형 보간으로 통과시켜 하나로 합칩니다. 원본에 이 LUT 하나를 건 결과와 앱 결과의 차이는 평균 ΔE 약 0.5 (육안 구분 불가) 입니다.
+- **전체** LUT 는 각 격자점에 ①②③ 을 적용한 뒤 ④ LUT 를 삼선형 보간으로 통과시켜 하나로 합칩니다. 원본에 이 LUT 하나를 건 결과와 앱 결과의 차이는 평균 ΔE 약 0.7 (육안 구분 불가) 입니다.
+- 노드 1 → 2 → 3 LUT 를 차례로 건 결과는 앱 결과와 같습니다 (ΔE 0.00).
 - `.cube` 는 표준 순서(**R 이 가장 빠르게 변함**)로 저장되며 `DOMAIN 0~1` 입니다.
 
 ---
@@ -132,7 +142,8 @@ tone_analyzer/
 └── src/tone_analyzer/
     ├── app.py                   # Streamlit 웹 앱
     ├── pipeline.py              # 전체 파이프라인 + 최종 LUT 3종 생성(build_final_luts)
-    ├── primaries.py             # Lift/Gamma/Gain + Contrast/Pivot 추정·적용
+    ├── primaries.py             # ①② Lift/Gamma/Gain → Contrast/Pivot 추정·적용
+    ├── white_balance.py         # ③ 화이트밸런스(Temp/Tint) 추정·적용
     ├── tone_curve.py            # 히스토그램 매칭 1D 톤 커브
     ├── color_matching.py        # 색 전이(Reinhard / 영역별 / IDT), 피부 가중치, 회귀 모델
     ├── lut.py                   # 3D LUT 생성·적용·합성, 피부 보호, 강도, .cube 저장
@@ -155,7 +166,7 @@ result = run_tone_matching_pipeline(
     output_directory="results/run_01",
     lut_size=33,
     tone_method="primaries",     # "primaries" | "histogram"
-    balance_strength=0.5,
+    balance_strength=0.5,         # ③ 화이트밸런스 강도
     color_method="reinhard",     # "reinhard" | "idt"
     tonal_regions=True,
     preserve_luminance=True,
@@ -164,18 +175,20 @@ result = run_tone_matching_pipeline(
 )
 
 print(result["primaries"])       # 추정된 프라이머리 값
-print(result["cube_path"])       # 톤 + 색 LUT
+print(result["white_balance"])   # Temp / Tint / RGB Gain
+print(result["cube_paths"])      # 전체 + 노드별 LUT 경로
 ```
 
 출력 폴더에는 다음 파일이 생성됩니다.
 
 | 파일 | 내용 |
 |---|---|
-| `target_tone_matched.png` | 톤 단계까지 적용한 이미지 |
+| `target_tone_matched.png` | ①②③ 까지 적용한 이미지 |
 | `target_3d_lut_matched.png` | 최종 이미지 |
-| `target_to_reference_{N}.cube` | 톤 + 색 LUT |
-| `target_to_reference_{N}_tone.cube` | 톤 단계만 |
-| `target_to_reference_{N}_color.cube` | 색 단계만 |
+| `target_to_reference_{N}.cube` | 전체 ①~④ |
+| `target_to_reference_{N}_1_primaries.cube` | 노드 1: ①② |
+| `target_to_reference_{N}_2_wb.cube` | 노드 2: ③ |
+| `target_to_reference_{N}_3_color.cube` | 노드 3: ④ |
 | `analysis_summary.json` | 톤 영역·대비 분석, 프라이머리 값과 진단 정보 |
 
 ## 앱 설정 요약
@@ -183,7 +196,7 @@ print(result["cube_path"])       # 톤 + 색 LUT
 | 구분 | 항목 | 기본값 | 설명 |
 |---|---|---|---|
 | 학습 설정 | 톤 단계 방식 | 프라이머리 | 또는 히스토그램 매칭 커브 |
-| | 프라이머리 밸런스 강도 | 0.5 | 중성색 밸런스를 Reference 쪽으로 옮기는 정도 |
+| | ③ 화이트밸런스 강도 | 0.5 | 중성색을 Reference 쪽으로 옮기는 정도 |
 | | LUT 크기 | 33 | 17 / 33 / 65 |
 | | 최대 학습 픽셀 수 | 100,000 | |
 | | 색 전이 방식 | reinhard | 또는 idt |

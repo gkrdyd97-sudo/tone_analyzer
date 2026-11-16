@@ -34,8 +34,12 @@ from .lut import (
 
 from .primaries import (
     apply_primaries,
-    apply_primaries_to_image,
     estimate_primaries,
+)
+
+from .white_balance import (
+    apply_white_balance,
+    estimate_white_balance,
 )
 
 from .result_io import (
@@ -55,6 +59,8 @@ def build_final_luts(
     lut_size,
     transfer_strength,
     skin_protection,
+    primaries_nodes=None,
+    white_balance_nodes=None,
 ):
     """
     현재 강도 / 피부 보호 설정으로 내보낼 LUT 3종을 만든다.
@@ -63,9 +69,11 @@ def build_final_luts(
     Returns
     -------
     dict
-        color    : 색 단계만 (톤 단계를 거친 이미지에 거는 LUT)
-        tone     : 톤 단계(프라이머리)만
-        combined : 톤 단계 + 색 단계 (원본 소스에 하나만 거는 LUT)
+        primaries     : ①② LGG + Contrast/Pivot 만        (노드 1)
+        white_balance : ③ 화이트밸런스만                    (노드 2)
+        tone          : ①②③ 를 합친 것
+        color         : ④ 컬러 그레이딩 (+ 피부 보호, 강도) (노드 3)
+        combined      : ①②③④ 전부 (원본 소스에 하나만 거는 LUT)
     """
 
     protected = protect_skin_in_lut(
@@ -86,9 +94,19 @@ def build_final_luts(
         lut_size=lut_size,
     )
 
+    identity = np.asarray(lut_input, dtype=np.float32)
+
     return {
-        "color": color_lut,
+        "primaries": (
+            np.asarray(primaries_nodes, dtype=np.float32)
+            if primaries_nodes is not None else identity
+        ),
+        "white_balance": (
+            np.asarray(white_balance_nodes, dtype=np.float32)
+            if white_balance_nodes is not None else identity
+        ),
         "tone": np.asarray(tone_stage_nodes, dtype=np.float32),
+        "color": color_lut,
         "combined": combined_lut,
     }
 
@@ -111,19 +129,19 @@ def run_tone_matching_pipeline(
     """
     전체 톤 매칭 파이프라인.
 
-    순서 (DaVinci 노드 구조와 같은 흐름)
-    ----------------------------------
-    1. 톤 단계
-       - "primaries": Lift / Gamma / Gain + Contrast / Pivot 추정 (기본)
-       - "histogram": Lab L 히스토그램 매칭 1D 커브 (이전 방식)
-    2. 색 단계: 톤 단계 결과 -> Reference 색감 (3D LUT)
-    3. 피부 보호 / 강도: 색 단계 LUT 에 적용
+    순서 (컬러리스트 작업 순서 / DaVinci 노드 구조)
+    ---------------------------------------------
+    ① Lift / Gamma / Gain   ┐ tone_method="primaries" (기본)
+    ② Contrast / Pivot      ┘ tone_method="histogram" 이면 히스토그램 매칭 커브로 대체
+    ③ 화이트밸런스 (Temp / Tint, 강도 = balance_strength 0~1)
+    ④ 컬러 그레이딩 (Reference 색감, 3D LUT) + 피부 보호 / 강도
 
     내보내는 .cube
     -------------
-    - target_to_reference_{N}.cube          : 톤 + 색 (원본 소스에 하나만 걸기)
-    - target_to_reference_{N}_tone.cube     : 톤 단계만 (노드 1)
-    - target_to_reference_{N}_color.cube    : 색 단계만 (노드 2)
+    - target_to_reference_{N}.cube             : ①②③④ 전부 (원본 소스에 하나만 걸기)
+    - target_to_reference_{N}_1_primaries.cube : ①② (노드 1)
+    - target_to_reference_{N}_2_wb.cube        : ③   (노드 2)
+    - target_to_reference_{N}_3_color.cube     : ④   (노드 3)
     """
 
     reference_path = Path(reference_path)
@@ -178,7 +196,7 @@ def run_tone_matching_pipeline(
     )
 
 
-    # 3. 톤 단계
+    # 3. 톤 단계: ① LGG → ② Contrast/Pivot (또는 히스토그램 커브)
 
     primaries_result = None
 
@@ -187,36 +205,57 @@ def run_tone_matching_pipeline(
         primaries_result = estimate_primaries(
             target_rgb=target_rgb,
             reference_rgb=reference_rgb,
-            balance_strength=balance_strength,
         )
 
         primaries = primaries_result["primaries"]
 
-        def tone_stage(pixels):
+        def primaries_stage(pixels):
             return apply_primaries(pixels, primaries)
-
-        target_tone_matched_rgb = apply_primaries_to_image(
-            target_rgb,
-            primaries,
-        )
 
     elif tone_method == "histogram":
 
-        def tone_stage(pixels):
+        def primaries_stage(pixels):
             return apply_tone_curve_to_pixels(pixels, tone_curve)
-
-        height, width = target_rgb.shape[:2]
-
-        target_tone_matched_rgb = (
-            tone_stage(target_rgb.reshape(-1, 3) / 255.0)
-            .reshape(height, width, 3)
-            * 255.0
-        ).round().astype(np.uint8)
 
     else:
         raise ValueError(
             "tone_method는 'primaries' 또는 'histogram' 이어야 합니다."
         )
+
+    height, width = target_rgb.shape[:2]
+
+    def apply_stage_to_image(stage, rgb_image):
+        output = stage(rgb_image.reshape(-1, 3).astype(np.float32) / 255.0)
+        return (
+            np.asarray(output).reshape(height, width, 3) * 255.0
+        ).round().astype(np.uint8)
+
+    target_primaries_rgb = apply_stage_to_image(
+        primaries_stage,
+        target_rgb,
+    )
+
+
+    # ③ 화이트밸런스 (①② 결과 기준으로 추정)
+
+    white_balance_result = estimate_white_balance(
+        target_rgb=target_primaries_rgb,
+        reference_rgb=reference_rgb,
+        strength=balance_strength,
+    )
+
+    white_balance = white_balance_result["white_balance"]
+
+    def white_balance_stage(pixels):
+        return apply_white_balance(pixels, white_balance)
+
+    def tone_stage(pixels):
+        return white_balance_stage(primaries_stage(pixels))
+
+    target_tone_matched_rgb = apply_stage_to_image(
+        white_balance_stage,
+        target_primaries_rgb,
+    )
 
 
     # 4. 색 단계 학습 쌍 생성
@@ -266,7 +305,15 @@ def run_tone_matching_pipeline(
         lut_size=lut_size,
     )
 
-    tone_stage_nodes = tone_stage(lut_input).astype(np.float32)
+    primaries_nodes = np.asarray(
+        primaries_stage(lut_input), dtype=np.float32
+    )
+    white_balance_nodes = np.asarray(
+        white_balance_stage(lut_input), dtype=np.float32
+    )
+    tone_stage_nodes = np.asarray(
+        tone_stage(lut_input), dtype=np.float32
+    )
 
     final_luts = build_final_luts(
         lut_input=lut_input,
@@ -275,6 +322,8 @@ def run_tone_matching_pipeline(
         lut_size=lut_size,
         transfer_strength=transfer_strength,
         skin_protection=skin_protection,
+        primaries_nodes=primaries_nodes,
+        white_balance_nodes=white_balance_nodes,
     )
 
 
@@ -291,10 +340,21 @@ def run_tone_matching_pipeline(
 
     tone_matched_image_path = output_directory / "target_tone_matched.png"
     final_image_path = output_directory / "target_3d_lut_matched.png"
-    cube_path = output_directory / f"target_to_reference_{lut_size}.cube"
-    tone_cube_path = output_directory / f"target_to_reference_{lut_size}_tone.cube"
-    color_cube_path = output_directory / f"target_to_reference_{lut_size}_color.cube"
     analysis_json_path = output_directory / "analysis_summary.json"
+
+    cube_paths = {
+        "combined": output_directory / f"target_to_reference_{lut_size}.cube",
+        "primaries": output_directory / f"target_to_reference_{lut_size}_1_primaries.cube",
+        "white_balance": output_directory / f"target_to_reference_{lut_size}_2_wb.cube",
+        "color": output_directory / f"target_to_reference_{lut_size}_3_color.cube",
+    }
+
+    cube_titles = {
+        "combined": "Target to Reference (1-4 all)",
+        "primaries": f"Target to Reference (1-2 primaries: {tone_method})",
+        "white_balance": "Target to Reference (3 white balance)",
+        "color": "Target to Reference (4 color grading)",
+    }
 
     save_rgb_image(
         rgb_image=target_tone_matched_rgb,
@@ -306,26 +366,13 @@ def run_tone_matching_pipeline(
         output_path=final_image_path,
     )
 
-    save_cube_file(
-        lut_output=final_luts["combined"],
-        lut_size=lut_size,
-        output_path=cube_path,
-        title="Target to Reference (tone + color)",
-    )
-
-    save_cube_file(
-        lut_output=final_luts["tone"],
-        lut_size=lut_size,
-        output_path=tone_cube_path,
-        title=f"Target to Reference (tone: {tone_method})",
-    )
-
-    save_cube_file(
-        lut_output=final_luts["color"],
-        lut_size=lut_size,
-        output_path=color_cube_path,
-        title="Target to Reference (color only)",
-    )
+    for key, path in cube_paths.items():
+        save_cube_file(
+            lut_output=final_luts[key],
+            lut_size=lut_size,
+            output_path=path,
+            title=cube_titles[key],
+        )
 
 
     # 9. 전체 결과
@@ -335,9 +382,10 @@ def run_tone_matching_pipeline(
         "target_path": str(target_path.resolve()),
         "tone_matched_image_path": str(tone_matched_image_path.resolve()),
         "final_image_path": str(final_image_path.resolve()),
-        "cube_path": str(cube_path.resolve()),
-        "tone_cube_path": str(tone_cube_path.resolve()),
-        "color_cube_path": str(color_cube_path.resolve()),
+        "cube_path": str(cube_paths["combined"].resolve()),
+        "cube_paths": {
+            key: str(path.resolve()) for key, path in cube_paths.items()
+        },
         "analysis_json_path": str(analysis_json_path.resolve()),
         "lut_size": int(lut_size),
         "sample_count": int(len(target_samples)),
@@ -359,6 +407,10 @@ def run_tone_matching_pipeline(
         "primaries_diagnostics": (
             primaries_result["diagnostics"] if primaries_result else None
         ),
+        "white_balance": white_balance,
+        "white_balance_diagnostics": white_balance_result["diagnostics"],
+        "primaries_nodes": primaries_nodes,
+        "white_balance_nodes": white_balance_nodes,
         "lut_input": lut_input,
         "tone_stage_nodes": tone_stage_nodes,
         "color_lut_raw": color_lut_raw,
@@ -368,6 +420,7 @@ def run_tone_matching_pipeline(
         "skin_protection": float(skin_protection),
         "skin_ratio": float(pair_data["skin_ratio"]),
         "target_rgb": target_rgb,
+        "target_primaries_rgb": target_primaries_rgb,
         "target_tone_matched_rgb": target_tone_matched_rgb,
         "target_3d_lut_rgb": target_3d_lut_rgb,
     }

@@ -53,6 +53,10 @@ from tone_analyzer.primaries import (
     format_primaries_table,
 )
 
+from tone_analyzer.white_balance import (
+    format_white_balance_table,
+)
+
 
 PREVIEW_MAX_WIDTH = 1600
 
@@ -119,22 +123,22 @@ tone_method = st.sidebar.selectbox(
     options=["primaries", "histogram"],
     index=0,
     format_func=lambda value: {
-        "primaries": "프라이머리 (Lift/Gamma/Gain + Contrast/Pivot)",
+        "primaries": "① LGG → ② Contrast/Pivot",
         "histogram": "히스토그램 매칭 커브 (이전 방식)",
     }[value],
 )
 
 
 balance_strength = st.sidebar.slider(
-    "프라이머리 밸런스 강도",
+    "③ 화이트밸런스 강도",
     min_value=0.0,
     max_value=1.0,
     value=0.5,
     step=0.05,
-    disabled=(tone_method != "primaries"),
     help=(
-        "중성색(회색 계열)의 색 균형을 Reference 쪽으로 옮기는 정도. "
-        "0이면 밝기와 대비만 맞춥니다."
+        "중성색(회색 계열)의 색을 Reference 쪽으로 옮기는 정도. "
+        "Reference 의 중성색에는 룩의 색감이 섞여 있을 수 있어 기본 0.5. "
+        "0이면 화이트밸런스를 건드리지 않습니다."
     ),
 )
 
@@ -383,6 +387,9 @@ if run_button:
             "original_preview_rgb": make_preview(
                 pipeline_result["target_rgb"]
             ),
+            "primaries_preview_rgb": make_preview(
+                pipeline_result["target_primaries_rgb"]
+            ),
             "skin_mask_preview": compute_skin_mask(preview_rgb),
             "lut_size": lut_size,
         }
@@ -424,6 +431,8 @@ if session_result is not None:
         lut_size=result_lut_size,
         transfer_strength=transfer_strength,
         skin_protection=skin_protection,
+        primaries_nodes=pipeline_result["primaries_nodes"],
+        white_balance_nodes=pipeline_result["white_balance_nodes"],
     )
 
     current_lut = current_luts["color"]
@@ -473,49 +482,29 @@ if session_result is not None:
     )
 
 
-    image_col_0, image_col_1, image_col_2 = (
-        st.columns(3)
-    )
-
-
     tone_label = (
-        "② 프라이머리 결과"
+        "①② LGG + Contrast"
         if pipeline_result["tone_method"] == "primaries"
-        else "② 히스토그램 커브 결과"
+        else "①② 히스토그램 커브"
     )
 
+    stage_images = [
+        ("원본 Target", session_result["original_preview_rgb"]),
+        (tone_label, session_result["primaries_preview_rgb"]),
+        ("③ + 화이트밸런스", session_result["preview_rgb"]),
+        ("④ + 컬러 그레이딩 (최종)", preview_after),
+    ]
 
-    with image_col_0:
-        st.write(
-            "① 원본 Target"
-        )
+    for row_start in (0, 2):
+        image_cols = st.columns(2)
 
-        st.image(
-            session_result["original_preview_rgb"],
-            width="stretch",
-        )
-
-
-    with image_col_1:
-        st.write(
-            tone_label
-        )
-
-        st.image(
-            session_result["preview_rgb"],
-            width="stretch",
-        )
-
-
-    with image_col_2:
-        st.write(
-            "③ + 색 단계 (최종)"
-        )
-
-        st.image(
-            preview_after,
-            width="stretch",
-        )
+        for column, (label, image) in zip(
+            image_cols,
+            stage_images[row_start:row_start + 2],
+        ):
+            with column:
+                st.write(label)
+                st.image(image, width="stretch")
 
 
     with st.expander("피부 보호 마스크 보기"):
@@ -529,62 +518,82 @@ if session_result is not None:
         )
 
 
-    # 프라이머리 값
+    # 단계별 추정값
+
+    st.subheader(
+        "단계별 추정값"
+    )
+
+    st.caption(
+        "표준 LGG 공식 기준 근사값입니다. DaVinci 휠에는 시작점으로 넣고 "
+        "눈으로 미세 조정하세요. Gamma 는 지수 값입니다 "
+        "(1.0 = 변화 없음, 1보다 작으면 중간톤이 어두워짐)."
+    )
+
+    def format_table(table):
+        return {
+            key: [
+                f"{value:.3f}" if isinstance(value, float) else value
+                for value in values
+            ]
+            for key, values in table.items()
+        }
+
+    value_cols = st.columns(2)
 
     if pipeline_result.get("primaries"):
 
         primaries = pipeline_result["primaries"]
         diagnostics = pipeline_result["primaries_diagnostics"]
 
-        st.subheader(
-            "프라이머리 추정값"
-        )
-
-        st.caption(
-            "적용 순서: Contrast/Pivot → Lift → Gain → Gamma. "
-            "표준 LGG 공식 기준 근사값이므로 DaVinci 휠에는 "
-            "시작점으로 넣고 눈으로 미세 조정하세요. "
-            "Gamma 는 지수 값입니다 (1.0 = 변화 없음, 1보다 작으면 중간톤이 어두워짐)."
-        )
-
-        primary_cols = st.columns([1, 3])
-
-        with primary_cols[0]:
-            st.metric("Contrast", f"{primaries['contrast']:.3f}")
-            st.metric("Pivot", f"{primaries['pivot']:.3f}")
-
-        with primary_cols[1]:
-            table = format_primaries_table(primaries)
+        with value_cols[0]:
+            st.write("①② Lift / Gamma / Gain → Contrast / Pivot")
             st.dataframe(
-                {
-                    key: (
-                        [f"{value:.3f}" for value in values]
-                        if key != "항목" else values
-                    )
-                    for key, values in table.items()
-                },
+                format_table(format_primaries_table(primaries)),
                 hide_index=True,
                 width="stretch",
             )
+
+            if diagnostics.get("parameters_at_bounds"):
+                st.warning(
+                    "허용 범위 끝에 닿은 값: "
+                    + ", ".join(diagnostics["parameters_at_bounds"])
+                    + ". 두 이미지의 노출 차이가 매우 커서 값이 극단적입니다. "
+                    "숫자는 참고만 하고 LUT 결과를 기준으로 판단하세요."
+                )
+
+    with value_cols[1]:
+        st.write("③ 화이트밸런스")
+        st.dataframe(
+            format_table(
+                format_white_balance_table(pipeline_result["white_balance"])
+            ),
+            hide_index=True,
+            width="stretch",
+        )
+        st.caption(
+            "Temp / Tint 는 이 앱의 단위입니다 (DaVinci 의 K 값과 다름). "
+            "DaVinci 에는 RGB Gain 비율로 옮기는 것이 정확합니다."
+        )
+
+    if pipeline_result.get("primaries"):
 
         curve_input = np.linspace(0.0, 1.0, 64)
         curve_output = apply_primaries(
             np.repeat(curve_input[:, None], 3, axis=1),
             primaries,
-        )
+        )[:, 1]
 
         chart_cols = st.columns(2)
 
         with chart_cols[0]:
-            st.write("채널별 전달 곡선 (입력 → 출력)")
+            st.write("①② 전달 곡선 (입력 → 출력)")
             st.line_chart(
                 {
-                    "R": curve_output[:, 0],
-                    "G": curve_output[:, 1],
-                    "B": curve_output[:, 2],
+                    "적용 후": curve_output,
                     "변화 없음": curve_input,
                 },
-                color=["#e5484d", "#30a46c", "#3e63dd", "#9b9b9b"],
+                color=["#3e63dd", "#9b9b9b"],
             )
 
         with chart_cols[1]:
@@ -608,8 +617,9 @@ if session_result is not None:
     )
 
     st.caption(
-        "원본 소스에는 '톤 + 색' LUT 하나만 걸면 앱 결과와 같습니다. "
-        "DaVinci 에서 노드를 나누고 싶다면 노드 1에 '톤', 노드 2에 '색' LUT를 거세요."
+        "원본 소스에는 '전체' LUT 하나만 걸면 앱 결과와 같습니다. "
+        "DaVinci 에서 노드를 나눌 때는 노드 1 → 2 → 3 순서로 거세요 "
+        "(세 개를 차례로 건 결과도 앱 결과와 같습니다)."
     )
 
 
@@ -620,14 +630,15 @@ if session_result is not None:
         f"_skin{int(round(skin_protection * 100)):03d}"
     )
 
-    cube_cols = st.columns(3)
+    cube_cols = st.columns(4)
 
     for column, (key, label, suffix) in zip(
         cube_cols,
         [
-            ("combined", "LUT: 톤 + 색 (원본 소스용)", ""),
-            ("tone", "LUT: 톤 단계만 (노드 1)", "_tone"),
-            ("color", "LUT: 색 단계만 (노드 2)", "_color"),
+            ("combined", "LUT: 전체 ①~④ (원본 소스용)", ""),
+            ("primaries", "노드 1: ①② LGG + Contrast", "_1_primaries"),
+            ("white_balance", "노드 2: ③ 화이트밸런스", "_2_wb"),
+            ("color", "노드 3: ④ 컬러 그레이딩", "_3_color"),
         ],
     ):
         with column:

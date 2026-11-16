@@ -110,8 +110,11 @@ def build_analysis_summary(
         "primaries_diagnostics": pipeline_result.get(
             "primaries_diagnostics"
         ),
-        "tone_cube_path": pipeline_result.get("tone_cube_path"),
-        "color_cube_path": pipeline_result.get("color_cube_path"),
+        "cube_paths": pipeline_result.get("cube_paths"),
+        "white_balance": pipeline_result.get("white_balance"),
+        "white_balance_diagnostics": pipeline_result.get(
+            "white_balance_diagnostics"
+        ),
         "transfer_strength": pipeline_result.get("transfer_strength"),
         "skin_protection": pipeline_result.get("skin_protection"),
     }
