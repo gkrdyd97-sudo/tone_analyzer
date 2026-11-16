@@ -27,3 +27,11 @@ outputs/*
 # IDE settings
 .vscode/
 .idea/
+
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+web_uploads/
+web_results/
+.DS_Store
+.env
