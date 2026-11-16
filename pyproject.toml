@@ -1,8 +1,10 @@
 [project]
 name = "tone-analyzer"
 version = "0.1.0"
-description = "Add your description here"
+description = "Reference 이미지의 톤과 색감을 분석해 DaVinci 등에서 쓸 수 있는 3D LUT(.cube)로 만드는 도구"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "gkrdyd97-sudo", email = "gkrdyd97@gmail.com" }
 ]
@@ -14,6 +16,7 @@ dependencies = [
     "opencv-python>=5.0.0.93",
     "pandas>=3.1.1",
     "scikit-learn>=1.9.1",
+    "scipy>=1.15",
     "streamlit>=1.67.0",
 ]
 

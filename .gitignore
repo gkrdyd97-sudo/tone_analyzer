@@ -35,3 +35,8 @@ web_uploads/
 web_results/
 .DS_Store
 .env
+
+# Not published: experiments and sample images
+notebooks/
+images/
+*.cube

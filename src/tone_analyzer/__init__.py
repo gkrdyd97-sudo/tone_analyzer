@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 정학용 (gkrdyd97-sudo)
+
 from .analysis import (
     analyze_all_tonal_regions,
     calculate_contrast,

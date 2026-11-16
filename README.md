@@ -1,506 +1,239 @@
-# Camera Tone Matching & LUT Generator
+# Tone Analyzer
 
-두 카메라로 촬영한 이미지를 비교하여 Target 카메라의 계조와 톤을 Reference 카메라에 맞추고, 최종적으로 LUT 파일을 제공하는 웹 애플리케이션을 만드는 프로젝트입니다.
+Reference 이미지의 톤과 색감을 Target 이미지에 옮기고, 그 변환을 **DaVinci Resolve 등에서 바로 쓸 수 있는 3D LUT(`.cube`)** 로 내보내는 Streamlit 웹 앱입니다.
 
-## 최종 사용 흐름
+컬러리스트의 작업 순서를 그대로 따릅니다.
 
 ```text
-사용자가 홈페이지 접속
+① 프라이머리 (Lift / Gamma / Gain + Contrast / Pivot)
         ↓
-Reference 이미지 업로드
-Target 이미지 업로드
+② 색 단계 (톤 영역별 색 전이)
         ↓
-밝기·색상·대비 분석
+③ 피부톤 보호 · 강도 조절
         ↓
-Target을 Reference에 맞춤
+.cube 내보내기 (톤+색 / 톤만 / 색만)
+```
+
+---
+
+## 빠른 시작
+
+```bash
+# 의존성 설치 (Python 3.12, uv 사용)
+uv sync
+
+# 웹 앱 실행
+uv run streamlit run src/tone_analyzer/app.py
+```
+
+1. **Reference**(따라 하고 싶은 룩)와 **Target**(보정할 이미지)을 업로드합니다.
+2. 사이드바의 **학습 설정**을 확인하고 `톤 매칭 시작`을 누릅니다.
+3. **실시간 조절**(LUT 강도, 피부톤 보호)을 움직이며 결과를 확인합니다. 재학습 없이 바로 반영됩니다.
+4. 원하는 설정에서 LUT를 다운로드합니다.
+
+---
+
+## 어떤 LUT를 받아야 하나요?
+
+| DaVinci 에서의 사용 방식 | 받을 파일 |
+|---|---|
+| LUT 하나로 끝내기 | **톤 + 색** (`..._{N}_sXXX_skinYYY.cube`) |
+| 노드를 나눠 단계별로 조절 | 노드 1: **톤만** (`_tone`), 노드 2: **색만** (`_color`) |
+| 프라이머리는 휠로 직접 맞추기 | **색만** (`_color`) — 앱의 프라이머리 추정값에 가깝게 맞춘 뒤 사용 |
+
+> ⚠️ **색공간 주의**: LUT는 Rec.709 디스플레이 이미지(JPG/PNG/스크린샷) 기준으로 만들어집니다.
+> S-Log, LogC 등 로그 소스에는 먼저 CST/변환 LUT로 Rec.709 로 바꾼 **다음 노드**에 거세요.
+
+> 강도와 피부 보호 값은 **다운로드 시점의 값으로 LUT에 고정**됩니다. 파일 이름의 `s080_skin085` 는 강도 0.80, 피부 보호 0.85 를 뜻합니다.
+
+---
+
+## 처리 과정
+
+### 1. 톤 단계 — 프라이머리 추정 (`primaries.py`)
+
+Target 에 적용할 프라이머리 값을 최적화(`scipy.optimize.least_squares`)로 찾습니다.
+
+| 맞추는 항목 | 결정되는 것 |
+|---|---|
+| 루마 분위수 (1, 5, 10, 25, 50, 75, 90, 95, 99%) | 블랙 레벨, 대비, 중간톤 밝기, 화이트 레벨 |
+| 섀도우 / 미드 / 하이라이트의 **중성색(저채도 픽셀)** 밸런스 | RGB 채널별 Lift / Gamma / Gain 차이 (색온도·틴트) |
+
+적용 순서와 수식 (값 범위 0~1, Rec.709 루마 기준):
+
+```text
+1. Contrast / Pivot : y = (x - pivot) * contrast + pivot     (RGB 공통, pivot = Target 루마 중앙값)
+2. Lift   (RGB별)   : y = y + lift * (1 - y)                 (흰색 고정, 검정 이동)
+3. Gain   (RGB별)   : y = y * gain                           (검정 고정, 흰색 이동)
+4. Gamma  (RGB별)   : y = y ** (1 / gamma)                   (지수. 1 = 변화 없음, < 1 이면 중간톤이 어두워짐)
+```
+
+- 밸런스는 **회색이어야 할 픽셀**만 보고 판단하므로, Reference 의 빨간 옷 같은 피사체 색에 끌려가지 않습니다.
+- R/G/B 값이 과하게 벌어지지 않도록 채널 간 차이에 벌점을 줍니다. 밸런스는 가볍게, 룩의 색감은 다음 색 단계가 담당합니다.
+- `프라이머리 밸런스 강도`(기본 0.5)로 밸런스를 얼마나 Reference 쪽으로 옮길지 정합니다. 0 이면 밝기·대비만 맞춥니다.
+- 앱에서 추정값 표, 채널별 전달 곡선, 전/후 루마 분위수 그래프를 볼 수 있습니다.
+
+> **DaVinci 수식과의 차이**: Resolve 내부 수식은 공개되어 있지 않아 표준 LGG 공식 기준의 **근사값**입니다. 휠에 옮겨 넣을 때는 시작점으로 쓰고 눈으로 미세 조정하세요. 특히 Gamma 는 지수 값이라 Resolve 휠 숫자와 단위가 다릅니다.
+
+이전 방식인 **히스토그램 매칭 커브**(Lab L 채널, 101포인트)도 `톤 단계 방식`에서 선택할 수 있습니다. 분포를 그대로 복사하므로 더 강하게 맞지만, 장면 내용 차이까지 커브에 반영되어 부자연스러울 수 있습니다.
+
+### 2. 색 단계 — 분포 기반 색 전이 (`color_matching.py`)
+
+Reference 와 Target 은 **서로 다른 사진**이므로 같은 좌표의 픽셀끼리는 아무 관계가 없습니다. 그래서 다음과 같이 학습 데이터를 만듭니다.
+
+```text
+Target 픽셀 샘플링 ─┐
+                    ├─▶ Target 색 분포를 Reference 분포로 전이
+Reference 픽셀 샘플링 ┘
         ↓
-보정 결과 미리보기
+(Target 원본 픽셀, 같은 픽셀의 전이 결과) = 학습 쌍
         ↓
-1D 톤 커브 또는 3D LUT(.cube) 다운로드
+3차 다항식 + Ridge 회귀로 부드러운 RGB→RGB 매핑 학습
+        ↓
+3D LUT 격자점(17³ / 33³ / 65³) 계산
 ```
 
-## 프로젝트 목표
+색 전이 방식:
 
-최종 홈페이지에서 사용자가 다음 작업을 할 수 있도록 합니다.
+| 방식 | 설명 |
+|---|---|
+| **reinhard** (기본) | Lab 평균/표준편차 매칭. `톤 영역별 색 전이`를 켜면 섀도우/미드/하이라이트 각각 따로 맞춘 뒤 부드럽게 섞음 (스플릿 토닝 재현) |
+| **idt** | Iterative Distribution Transfer (Pitié 2005). 분포 전체를 맞추므로 강하지만, Reference 의 특정 색이 엉뚱한 곳으로 번질 수 있음 |
 
-1. Reference 이미지 업로드
-2. Target 이미지 업로드
-3. 두 이미지의 밝기·대비·색상 차이 분석
-4. Shadow / Midtone / Highlight 차이 확인
-5. Target을 Reference에 맞춘 결과 확인
-6. `.cube` LUT 다운로드
+`밝기는 1D 톤 커브 유지`(기본 켜짐)를 켜면 밝기는 톤 단계 결과를 유지하고 색(Lab a, b)만 옮깁니다.
 
-처음에는 JPG 이미지로 학습하고, 이후 Log 원본과 실제 카메라 매칭으로 확장합니다.
+### 3. 피부톤 보호 · 강도 (`lut.py`)
 
-## Reference와 Target
+두 기능 모두 **학습이 아니라 LUT 격자점에 직접** 적용되므로 `.cube` 에 그대로 반영되고, 앱에서 실시간으로 조절됩니다.
 
-- **Reference**: 기준으로 삼을 카메라 또는 이미지
-- **Target**: Reference의 계조와 톤에 맞출 카메라 또는 이미지
+- **피부톤 보호**: 각 격자점의 입력 색이 피부색일 가능성(Lab 색상각 약 0~65°, 적당한 채도, 중간 밝기)을 계산하고, 그만큼 출력을 원래 색으로 되돌립니다. 피부색은 RGB 공간에서 얇은 영역이라 보간 중 보호가 새지 않도록 가중치를 이웃 격자로 한 칸 넓힙니다(3×3×3 dilation).
+- **LUT 강도**: `identity × (1 − s) + LUT × s`
 
-```text
-Reference = 카메라 A
-Target    = 카메라 B
+| 피부 보호 | 0 | 0.6 | 0.85 | 1.0 |
+|---|---|---|---|---|
+| 피부 영역 평균 ΔE (강도 0.8, 예시 이미지) | 14.9 | 5.9 | 2.2 | 0.1 |
 
-Target 이미지
-→ Reference와 비슷한 계조와 색상
-```
+### 4. LUT 합성과 내보내기
 
-정확한 카메라 매칭을 위해서는 두 이미지가 같은 장면, 같은 시간, 같은 조명에서 촬영된 것이 좋습니다. 가능하면 ColorChecker도 함께 촬영합니다.
+- **톤 + 색** LUT 는 각 격자점에 톤 단계를 적용한 뒤 색 LUT 를 삼선형 보간으로 통과시켜 하나로 합칩니다. 원본에 이 LUT 하나를 건 결과와 앱 결과의 차이는 평균 ΔE 약 0.5 (육안 구분 불가) 입니다.
+- `.cube` 는 표준 순서(**R 이 가장 빠르게 변함**)로 저장되며 `DOMAIN 0~1` 입니다.
 
-## 이 프로젝트는 RAG가 아니다
-
-핵심 기능은 RAG가 아니라 이미지 처리와 색상 변환입니다.
-
-```text
-OpenCV + NumPy
-→ 이미지 픽셀 분석
-→ 밝기와 색상 비교
-→ 톤 커브 생성
-→ 3D LUT 생성
-```
-
-RAG는 문서나 분석 결과를 검색한 뒤 LLM이 자연어로 답변하게 만드는 기술입니다. 나중에 다음 기능을 추가하고 싶다면 RAG를 연결할 수 있습니다.
-
-```text
-"기준 샷과 가장 비슷한 이미지를 찾아줘."
-"이 Target의 Shadow가 기준보다 얼마나 밝아?"
-"대비가 강한 샷만 보여줘."
-```
-
-하지만 LUT 생성 자체에는 RAG가 필요하지 않습니다.
-
-## 왜 처음에는 Notebook을 사용하는가?
-
-개발은 `ipynb`와 `.py`를 함께 사용합니다.
-
-### Notebook의 역할
-
-Notebook은 학습과 실험을 위한 공간입니다.
-
-```text
-이미지 읽기
-→ 결과 확인
-→ 그래프 확인
-→ 코드 수정
-→ 다시 실행
-```
-
-Notebook을 사용하는 이유:
-
-- 코드를 셀 단위로 실행할 수 있음
-- 이미지와 그래프를 바로 확인할 수 있음
-- 중간 계산 결과를 확인하기 쉬움
-- Markdown으로 개념과 설명을 함께 기록할 수 있음
-- 초보자가 NumPy와 이미지 배열을 이해하기 좋음
-
-### Python 파일의 역할
-
-실제 애플리케이션 기능은 `.py` 파일에 작성합니다.
-
-```text
-Notebook에서 실험
-→ 작동하는 코드를 함수로 정리
-→ src 패키지에 저장
-→ 웹 앱에서 import
-```
-
-Notebook에 모든 코드를 넣으면 배포와 유지보수가 어려워집니다. 따라서 Notebook은 실험용, Python 모듈은 실제 기능용으로 분리합니다.
-
-## 권장 기술 구조
-
-```text
-Notebook
-    ↓ 실험이 끝난 코드
-Python 모듈
-    ↓ import
-Streamlit 웹 앱
-    ↓ 배포
-사용자 홈페이지
-```
-
-초기 웹 앱은 Streamlit으로 만듭니다. Streamlit은 Python 코드만으로 파일 업로드, 이미지 표시, 버튼, 다운로드 기능을 만들 수 있어 초보자에게 적합합니다.
+---
 
 ## 프로젝트 구조
 
 ```text
 tone_analyzer/
 ├── README.md
-├── pyproject.toml
-├── uv.lock
-├── app.py
-├── src/
-│   └── tone_analyzer/
-│       ├── __init__.py
-│       ├── image_io.py
-│       ├── analysis.py
-│       ├── tone_curve.py
-│       ├── color_matching.py
-│       └── lut.py
-├── notebooks/
-│   ├── 01_image_loading.ipynb
-│   ├── 02_tone_analysis.ipynb
-│   ├── 03_reference_target_comparison.ipynb
-│   ├── 04_tone_curve.ipynb
-│   └── 05_3d_lut.ipynb
-├── tests/
-│   ├── test_image_io.py
-│   └── test_analysis.py
-├── images/
-├── results/
-└── .gitignore
+├── pyproject.toml / uv.lock
+├── images/                      # 예제 입력 (git 제외)
+├── results/                     # 실험 결과 (git 제외)
+├── notebooks/                   # 실험용 노트북 (git 제외)
+└── src/tone_analyzer/
+    ├── app.py                   # Streamlit 웹 앱
+    ├── pipeline.py              # 전체 파이프라인 + 최종 LUT 3종 생성(build_final_luts)
+    ├── primaries.py             # Lift/Gamma/Gain + Contrast/Pivot 추정·적용
+    ├── tone_curve.py            # 히스토그램 매칭 1D 톤 커브
+    ├── color_matching.py        # 색 전이(Reinhard / 영역별 / IDT), 피부 가중치, 회귀 모델
+    ├── lut.py                   # 3D LUT 생성·적용·합성, 피부 보호, 강도, .cube 저장
+    ├── analysis.py              # 밝기·톤 영역·대비 분석
+    ├── image_io.py              # 이미지 읽기/저장/검증
+    ├── result_io.py             # 분석 결과 JSON 저장
+    ├── config.py
+    ├── web_uploads/             # 앱 업로드 파일 (작업별 폴더, git 제외)
+    └── web_results/             # 앱 결과 파일 (작업별 폴더, git 제외)
 ```
 
-## 파일별 역할
+## 코드에서 사용하기
 
-### `app.py`
+```python
+from tone_analyzer.pipeline import run_tone_matching_pipeline
 
-홈페이지의 진입점입니다. 파일 업로드, 분석 버튼, 미리보기, 다운로드 기능을 담당합니다.
+result = run_tone_matching_pipeline(
+    reference_path="images/reference/reference_1.png",
+    target_path="images/target/target_1.png",
+    output_directory="results/run_01",
+    lut_size=33,
+    tone_method="primaries",     # "primaries" | "histogram"
+    balance_strength=0.5,
+    color_method="reinhard",     # "reinhard" | "idt"
+    tonal_regions=True,
+    preserve_luminance=True,
+    transfer_strength=0.8,
+    skin_protection=0.85,
+)
 
-### `image_io.py`
-
-이미지를 읽고 RGB, Lab 등 필요한 색공간으로 변환합니다.
-
-### `analysis.py`
-
-Shadow, Midtone, Highlight, 평균 밝기, 채도, 대비, 히스토그램 등을 계산합니다.
-
-### `tone_curve.py`
-
-Target의 밝기를 Reference의 밝기에 맞추는 1D 톤 커브를 만듭니다.
-
-### `color_matching.py`
-
-두 이미지의 RGB 또는 Lab 색상 차이를 계산하고 변환 관계를 만듭니다.
-
-### `lut.py`
-
-3D 색상 변환 모델을 만들고 `.cube` 파일로 저장합니다.
-
-## 설치
-
-```bash
-uv add opencv-python numpy pandas matplotlib scipy scikit-learn streamlit ipykernel
+print(result["primaries"])       # 추정된 프라이머리 값
+print(result["cube_path"])       # 톤 + 색 LUT
 ```
 
-Jupyter 커널 등록:
+출력 폴더에는 다음 파일이 생성됩니다.
 
-```bash
-uv run python -m ipykernel install --user \
-  --name tone-analyzer \
-  --display-name "Python (tone_analyzer)"
-```
+| 파일 | 내용 |
+|---|---|
+| `target_tone_matched.png` | 톤 단계까지 적용한 이미지 |
+| `target_3d_lut_matched.png` | 최종 이미지 |
+| `target_to_reference_{N}.cube` | 톤 + 색 LUT |
+| `target_to_reference_{N}_tone.cube` | 톤 단계만 |
+| `target_to_reference_{N}_color.cube` | 색 단계만 |
+| `analysis_summary.json` | 톤 영역·대비 분석, 프라이머리 값과 진단 정보 |
 
-Notebook에서 `Python (tone_analyzer)` 커널을 선택합니다.
+## 앱 설정 요약
 
-## 전체 개발 로드맵
+| 구분 | 항목 | 기본값 | 설명 |
+|---|---|---|---|
+| 학습 설정 | 톤 단계 방식 | 프라이머리 | 또는 히스토그램 매칭 커브 |
+| | 프라이머리 밸런스 강도 | 0.5 | 중성색 밸런스를 Reference 쪽으로 옮기는 정도 |
+| | LUT 크기 | 33 | 17 / 33 / 65 |
+| | 최대 학습 픽셀 수 | 100,000 | |
+| | 색 전이 방식 | reinhard | 또는 idt |
+| | 톤 영역별 색 전이 | 켜짐 | reinhard 에서만 |
+| | 밝기 유지 (색만 전이) | 켜짐 | |
+| 실시간 조절 | LUT 강도 | 0.8 | 재학습 없이 반영 |
+| | 피부톤 보호 | 0.85 | 재학습 없이 반영 |
 
-### Phase 1. Python과 NumPy 기초
+학습 설정을 바꾸면 `톤 매칭 시작`을 다시 눌러야 합니다.
 
-학습 내용:
+---
 
-- 변수와 자료형
-- 리스트와 딕셔너리
-- NumPy 배열
-- 이미지의 높이·너비·채널
-- 인덱싱과 슬라이싱
-- Boolean mask
-- 평균과 표준편차
-- JSON 저장과 NumPy 자료형 변환
+## 한계와 주의사항
 
-산출물:
+- **색공간**: 8비트 Rec.709 디스플레이 이미지 기준입니다. 로그/RAW 소스용 입력 변환은 아직 없습니다.
+- **프라이머리 값은 근사치**입니다 (위 "DaVinci 수식과의 차이" 참고). 노출 차이가 매우 크면 Gamma 등이 허용 범위 끝(0.4~2.5)에 닿을 수 있습니다.
+- **내용 차이는 따라가지 않습니다**: 장면 구성이 다르면(예: Reference 에 검은 옷이 많음) 섀도우 분포가 완전히 같아지지 않습니다. 의도된 동작입니다.
+- **피부 판정은 색 기반**입니다. 주황빛 배경이 함께 보호되거나, 진한 립 컬러처럼 채도가 높은 부분은 보호되지 않을 수 있습니다.
+- **클리핑된 정보는 복원할 수 없습니다**: 날아간 하이라이트, 뭉개진 섀도우의 디테일은 LUT 로 되살릴 수 없습니다.
+- **같은 장면의 카메라 매칭**(같은 조명·구도, ColorChecker 촬영)이라면 분포 전이보다 픽셀/패치 대응 기반 방식이 더 정확합니다. 현재 구현은 서로 다른 장면 간 룩 매칭에 맞춰져 있습니다.
+- **업로드 파일은 `web_uploads/` 에 계속 쌓입니다.** 배포 전에는 저장하지 않도록 하거나 주기적으로 정리해야 합니다.
 
-```text
-Python/NumPy 기초 Notebook
-```
+## 다음 개선 후보
 
-### Phase 2. 이미지 읽기와 표시
+- 로그 소스 지원 (S-Log3 / LogC / DaVinci Intermediate 입력 변환, 로그 공간 대비·피벗)
+- 회색 램프·컬러 차트 기반 LUT 자동 검증 (밴딩·뒤집힘·클리핑)
+- Reference 여러 장의 통계 결합
+- 팔레트(k-means) 매칭, 시맨틱 분할 기반 영역별 매칭
+- 레퍼런스 유사도 지표 (Lab 히스토그램 거리, 영역별 ΔE2000)
+- 테스트 코드 (`tests/`)
 
-작업:
+## 개발 메모
 
-1. 파일 경로 설정
-2. JPG/PNG 읽기
-3. BGR을 RGB로 변환
-4. 이미지 크기 확인
-5. Reference와 Target을 나란히 표시
+- Notebook 은 실험용, `src/tone_analyzer/` 의 모듈은 실제 기능용으로 분리합니다.
+- Jupyter 커널 등록:
 
-커밋:
+  ```bash
+  uv run python -m ipykernel install --user \
+    --name tone-analyzer \
+    --display-name "Python (tone_analyzer)"
+  ```
 
-```text
-Add image loading and preview
-```
+- 커밋 전 확인: `git status`, `git diff`, `git diff --check`
 
-### Phase 3. 밝기와 색공간 분석
+---
 
-작업:
+## 라이선스
 
-1. RGB를 Lab으로 변환
-2. L 채널에서 밝기 추출
-3. 밝기 히스토그램 표시
-4. 평균·최솟값·최댓값·백분위 계산
-5. HSV에서 채도 계산
+[MIT License](LICENSE) © 2026 정학용 ([gkrdyd97-sudo](https://github.com/gkrdyd97-sudo))
 
-커밋:
+자유롭게 사용·수정·배포할 수 있으며, **저작권 표시와 라이선스 전문을 함께 유지**해야 합니다.
 
-```text
-Add lightness and color analysis
-```
-
-### Phase 4. Shadow / Midtone / Highlight 분석
-
-밝기 기준으로 세 영역을 나눕니다.
-
-```text
-Shadow    → 어두운 영역
-Midtone   → 중간 밝기 영역
-Highlight → 밝은 영역
-```
-
-분석값:
-
-- 각 영역의 픽셀 비율
-- 평균 밝기
-- 밝기 표준편차
-- 평균 RGB
-- 평균 채도
-- Lab의 a/b 색상 방향
-
-커밋:
-
-```text
-Add tonal region analysis
-```
-
-### Phase 5. Reference와 Target 비교
-
-```text
-Target Shadow - Reference Shadow
-Target Midtone - Reference Midtone
-Target Highlight - Reference Highlight
-Target 대비 - Reference 대비
-Target 색상 - Reference 색상
-```
-
-결과 예시:
-
-```text
-Target은 Reference보다 전체적으로 밝음
-Target Shadow가 Reference보다 파란색
-Target의 대비가 Reference보다 약함
-```
-
-커밋:
-
-```text
-Add reference target comparison
-```
-
-### Phase 6. 1D 톤 커브 생성
-
-```text
-Target 밝기 → Reference 밝기
-```
-
-작업:
-
-1. 두 이미지의 밝기 백분위 계산
-2. 같은 백분위끼리 대응
-3. `np.interp()`로 중간값 보간
-4. Target의 Lab L 채널에 적용
-5. 보정 이미지 저장
-
-커밋:
-
-```text
-Generate one dimensional tone curve
-```
-
-### Phase 7. 색상 매칭
-
-Lab과 HSV를 활용하여 다음을 분석합니다.
-
-```text
-Shadow가 너무 파란가?
-Highlight가 너무 노란가?
-Midtone의 채도가 너무 높은가?
-```
-
-커밋:
-
-```text
-Add color matching analysis
-```
-
-### Phase 8. 3D LUT 생성
-
-```text
-Target R,G,B → Reference R,G,B
-```
-
-작업:
-
-1. 두 이미지를 같은 크기와 구도로 맞춤
-2. 같은 위치의 Target/Reference 픽셀 수집
-3. RGB를 0~1로 정규화
-4. 색상 변환 관계 학습
-5. 17³ 또는 33³ 격자 생성
-6. 각 격자점의 출력 RGB 예측
-
-커밋:
-
-```text
-Build 3D color transform
-```
-
-### Phase 9. `.cube` LUT 저장
-
-```text
-results/target_to_reference_17.cube
-```
-
-커밋:
-
-```text
-Export 3D LUT as cube file
-```
-
-### Phase 10. Streamlit 홈페이지
-
-웹 화면:
-
-```text
-Reference 업로드
-Target 업로드
-분석 시작 버튼
-분석 결과 표
-원본과 보정 이미지 비교
-LUT 다운로드 버튼
-```
-
-로컬 실행:
-
-```bash
-uv run streamlit run app.py
-```
-
-커밋:
-
-```text
-Add Streamlit upload and preview app
-```
-
-### Phase 11. 테스트
-
-테스트 대상:
-
-- 이미지 경로 오류
-- 지원하지 않는 파일
-- 빈 이미지
-- 서로 다른 크기의 이미지
-- 완전히 검은 이미지
-- 완전히 흰 이미지
-- LUT 파일 헤더
-
-커밋:
-
-```text
-Add analysis and LUT tests
-```
-
-### Phase 12. 배포
-
-배포 전 점검:
-
-- API 키와 비밀값이 저장소에 없는가
-- 개인 촬영 이미지가 저장소에 없는가
-- 의존성이 `pyproject.toml`에 기록되었는가
-- 업로드 파일 크기 제한이 있는가
-- 업로드 파일을 서버에 영구 저장하지 않는가
-- LUT 다운로드가 정상 작동하는가
-- 오류 메시지가 이해하기 쉬운가
-
-초기 배포 후보:
-
-- Streamlit Community Cloud
-- Hugging Face Spaces
-- Render
-- 개인 서버
-
-## 이미지와 Log 원본
-
-학습 단계에서는 JPG와 PNG를 사용합니다. 실제 카메라 매칭에서는 Log 원본을 사용할 수 있지만, 카메라별 감마와 색역을 먼저 해석해야 합니다.
-
-```text
-카메라 A Log → 공통 작업 색공간
-카메라 B Log → 공통 작업 색공간
-        ↓
-밝기·색상 비교
-        ↓
-보정 및 LUT 생성
-```
-
-처음에는 Log 원본에 카메라 전용 Log-to-Rec.709 또는 Log-to-ACES 변환을 적용한 뒤 Python 분석을 시작합니다.
-
-## 중요한 제한사항
-
-서로 다른 장면의 이미지를 사용하면 색상 차이가 카메라 때문인지 장면 때문인지 구분하기 어렵습니다.
-
-또한 LUT는 이미 클리핑되어 사라진 정보를 복원할 수 없습니다.
-
-```text
-완전히 날아간 Highlight → 원래 색상 복원 불가
-완전히 뭉개진 Shadow → 원래 디테일 복원 불가
-```
-
-가장 정확한 카메라 매칭을 위해서는 같은 조명 아래에서 ColorChecker를 촬영하는 것을 권장합니다.
-
-## Git 커밋 전략
-
-각 단계가 작동할 때마다 하나의 커밋을 남깁니다.
-
-```text
-Initialize project documentation
-Add image loading and preview
-Add lightness and color analysis
-Add tonal region analysis
-Add reference target comparison
-Generate one dimensional tone curve
-Add tone curve application
-Build 3D color transform
-Export 3D LUT as cube file
-Add Streamlit upload app
-Add tests and deployment configuration
-```
-
-커밋 전 확인:
-
-```bash
-git status
-git diff
-git diff --check
-```
-
-커밋:
-
-```bash
-git add 파일명
-git commit -m "변경 내용"
-```
-
-## 현재 시작점
-
-우리는 다음 순서로 직접 코드를 작성합니다.
-
-```text
-1. Python과 NumPy 기초
-2. 이미지 읽기와 표시
-3. Lab 밝기 분석
-4. Shadow/Midtone/Highlight 분석
-5. Reference/Target 비교
-6. 1D 톤 커브
-7. 색상 매칭
-8. 3D LUT
-9. Streamlit 홈페이지
-10. 배포
-```
-
-각 단계에서 먼저 Notebook에 전체 코드를 작성하고, 코드가 작동하는 것을 확인한 다음 설명과 함께 Python 모듈로 옮깁니다.
+예제 이미지는 저작권 문제로 저장소에 포함하지 않습니다. 직접 가진 이미지로 테스트해 주세요.

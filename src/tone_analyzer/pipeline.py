@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 정학용 (gkrdyd97-sudo)
+
 from pathlib import Path
 
 import numpy as np

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 정학용 (gkrdyd97-sudo)
+
 """
 DaVinci Resolve 스타일 프라이머리(Lift / Gamma / Gain + Contrast / Pivot) 추정.
 
