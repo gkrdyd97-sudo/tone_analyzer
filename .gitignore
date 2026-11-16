@@ -40,3 +40,5 @@ web_results/
 notebooks/
 images/
 *.cube
+
+.claude/
