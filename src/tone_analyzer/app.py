@@ -57,6 +57,12 @@ from tone_analyzer.white_balance import (
     format_white_balance_table,
 )
 
+from tone_analyzer.skin_tone import (
+    SKIN_LINE_HUE,
+    measure_skin,
+    render_vectorscope,
+)
+
 
 PREVIEW_MAX_WIDTH = 1600
 
@@ -205,7 +211,7 @@ transfer_strength = st.sidebar.slider(
 
 
 skin_protection = st.sidebar.slider(
-    "피부톤 보호",
+    "④ 피부톤 보호",
     min_value=0.0,
     max_value=1.0,
     value=0.85,
@@ -214,6 +220,44 @@ skin_protection = st.sidebar.slider(
         "피부색으로 추정되는 색의 변화를 이 비율만큼 되돌립니다. "
         "재학습 없이 즉시 반영됩니다."
     ),
+)
+
+
+st.sidebar.subheader(
+    "⑤ 스킨톤 교정"
+)
+
+
+skin_target_mode = st.sidebar.radio(
+    "교정 목표",
+    options=["line", "reference"],
+    format_func=lambda value: {
+        "line": "스킨톤 라인 (벡터스코프 I 라인)",
+        "reference": "Reference 속 피부 색",
+    }[value],
+    help=(
+        "Reference 에 피부가 충분히 없으면 스킨톤 라인을 사용합니다."
+    ),
+)
+
+
+skin_hue_strength = st.sidebar.slider(
+    "색상 교정 강도",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.5,
+    step=0.05,
+    help="피부 색상과 목표 색상의 차이를 이 비율만큼 줄입니다. 0이면 교정하지 않습니다.",
+)
+
+
+skin_saturation = st.sidebar.slider(
+    "피부 채도",
+    min_value=0.5,
+    max_value=1.5,
+    value=1.0,
+    step=0.05,
+    help="피부의 채도 배율. 1.0 = 그대로.",
 )
 
 
@@ -366,6 +410,9 @@ if run_button:
                     preserve_luminance=preserve_luminance,
                     tonal_regions=tonal_regions,
                     skin_protection=skin_protection,
+                    skin_target_mode=skin_target_mode,
+                    skin_hue_strength=skin_hue_strength,
+                    skin_saturation=skin_saturation,
                     tone_method=tone_method,
                     balance_strength=balance_strength,
                 )
@@ -424,6 +471,20 @@ if session_result is not None:
     pipeline_result = session_result["pipeline"]
     result_lut_size = session_result["lut_size"]
 
+    reference_skin = pipeline_result.get("reference_skin") or {}
+
+    if skin_target_mode == "reference" and reference_skin.get("hue") is not None:
+        skin_target_hue = reference_skin["hue"]
+        skin_target_label = "Reference 피부"
+    else:
+        skin_target_hue = SKIN_LINE_HUE
+        skin_target_label = "스킨톤 라인"
+        if skin_target_mode == "reference":
+            st.info(
+                "Reference 이미지에서 피부를 충분히 찾지 못해 "
+                "스킨톤 라인을 목표로 사용합니다."
+            )
+
     current_luts = build_final_luts(
         lut_input=pipeline_result["lut_input"],
         tone_stage_nodes=pipeline_result["tone_stage_nodes"],
@@ -433,13 +494,23 @@ if session_result is not None:
         skin_protection=skin_protection,
         primaries_nodes=pipeline_result["primaries_nodes"],
         white_balance_nodes=pipeline_result["white_balance_nodes"],
+        skin_target_hue=skin_target_hue,
+        skin_hue_strength=skin_hue_strength,
+        skin_saturation=skin_saturation,
+        skin_chroma=(pipeline_result.get("target_skin") or {}).get("chroma"),
     )
 
     current_lut = current_luts["color"]
 
-    preview_after = apply_3d_lut(
+    preview_graded = apply_3d_lut(
         rgb_image=session_result["preview_rgb"],
         lut_output=current_lut,
+        lut_size=result_lut_size,
+    )
+
+    preview_after = apply_3d_lut(
+        rgb_image=preview_graded,
+        lut_output=current_luts["skin"],
         lut_size=result_lut_size,
     )
 
@@ -478,7 +549,8 @@ if session_result is not None:
     # 결과 이미지
 
     st.subheader(
-        f"결과 이미지 (LUT 강도 {transfer_strength:.2f} / 피부 보호 {skin_protection:.2f})"
+        f"결과 이미지 (LUT 강도 {transfer_strength:.2f} / 피부 보호 {skin_protection:.2f} "
+        f"/ 스킨 교정 {skin_hue_strength:.2f})"
     )
 
 
@@ -492,19 +564,83 @@ if session_result is not None:
         ("원본 Target", session_result["original_preview_rgb"]),
         (tone_label, session_result["primaries_preview_rgb"]),
         ("③ + 화이트밸런스", session_result["preview_rgb"]),
-        ("④ + 컬러 그레이딩 (최종)", preview_after),
+        ("④ + 컬러 그레이딩", preview_graded),
+        ("⑤ + 스킨톤 교정 (최종)", preview_after),
     ]
 
-    for row_start in (0, 2):
-        image_cols = st.columns(2)
+    for row_start in (0, 3):
+        image_cols = st.columns(3)
 
         for column, (label, image) in zip(
             image_cols,
-            stage_images[row_start:row_start + 2],
+            stage_images[row_start:row_start + 3],
         ):
             with column:
                 st.write(label)
                 st.image(image, width="stretch")
+
+
+    # ⑤ 스킨톤 확인
+
+    st.subheader(
+        "⑤ 스킨톤"
+    )
+
+    skin_before = measure_skin(preview_graded)
+    skin_after = measure_skin(preview_after)
+
+    def format_hue(value):
+        return "-" if value is None else f"{value:.1f}°"
+
+    skin_cols = st.columns(4)
+    skin_cols[0].metric(
+        f"목표 ({skin_target_label})",
+        format_hue(skin_target_hue),
+    )
+    skin_cols[1].metric(
+        "피부 색상 (교정 전)",
+        format_hue(skin_before["hue"]),
+    )
+    skin_cols[2].metric(
+        "피부 색상 (교정 후)",
+        format_hue(skin_after["hue"]),
+        delta=(
+            None
+            if skin_before["hue"] is None or skin_after["hue"] is None
+            else f"{skin_after['hue'] - skin_before['hue']:+.1f}°"
+        ),
+        delta_color="off",
+    )
+    skin_cols[3].metric(
+        "Reference 피부 색상",
+        format_hue(reference_skin.get("hue")),
+    )
+
+    st.caption(
+        "Lab 색상각 기준 (0° = 마젠타/분홍 쪽, 90° = 노랑 쪽). "
+        f"스킨톤 라인은 약 {SKIN_LINE_HUE:.0f}° 입니다. "
+        "피부는 색만으로 판단하므로 같은 색의 배경도 함께 바뀔 수 있습니다."
+    )
+
+    scope_cols = st.columns(2)
+
+    with scope_cols[0]:
+        st.write("벡터스코프: ④ 후 (교정 전)")
+        st.image(
+            render_vectorscope(preview_graded, target_hue=skin_target_hue),
+            width="stretch",
+        )
+
+    with scope_cols[1]:
+        st.write("벡터스코프: ⑤ 후 (교정 후)")
+        st.image(
+            render_vectorscope(preview_after, target_hue=skin_target_hue),
+            width="stretch",
+        )
+
+    st.caption(
+        "노란 선: 스킨톤 라인 / 주황 점선: 현재 교정 목표 (스킨톤 라인과 다를 때)"
+    )
 
 
     with st.expander("피부 보호 마스크 보기"):
@@ -618,27 +754,35 @@ if session_result is not None:
 
     st.caption(
         "원본 소스에는 '전체' LUT 하나만 걸면 앱 결과와 같습니다. "
-        "DaVinci 에서 노드를 나눌 때는 노드 1 → 2 → 3 순서로 거세요 "
-        "(세 개를 차례로 건 결과도 앱 결과와 같습니다)."
+        "DaVinci 에서 노드를 나눌 때는 노드 1 → 2 → 3 → 4 순서로 거세요 "
+        "(차례로 건 결과도 앱 결과와 같습니다)."
     )
 
 
     download_cols = st.columns(3)
 
+    current_skin_key = (
+        skin_target_mode,
+        skin_hue_strength,
+        skin_saturation,
+    )
+
     strength_tag = (
         f"s{int(round(transfer_strength * 100)):03d}"
         f"_skin{int(round(skin_protection * 100)):03d}"
+        f"_fix{int(round(skin_hue_strength * 100)):03d}"
     )
 
-    cube_cols = st.columns(4)
+    cube_cols = st.columns(5)
 
     for column, (key, label, suffix) in zip(
         cube_cols,
         [
-            ("combined", "LUT: 전체 ①~④ (원본 소스용)", ""),
+            ("combined", "LUT: 전체 ①~⑤ (원본 소스용)", ""),
             ("primaries", "노드 1: ①② LGG + Contrast", "_1_primaries"),
             ("white_balance", "노드 2: ③ 화이트밸런스", "_2_wb"),
             ("color", "노드 3: ④ 컬러 그레이딩", "_3_color"),
+            ("skin", "노드 4: ⑤ 스킨톤 교정", "_4_skin"),
         ],
     ):
         with column:
@@ -667,6 +811,7 @@ if session_result is not None:
             full_resolution is not None
             and full_resolution["strength"] == transfer_strength
             and full_resolution["skin"] == skin_protection
+            and full_resolution.get("skin_correction") == current_skin_key
         ):
             st.download_button(
                 label="보정 이미지 다운로드 (원본 해상도)",
@@ -678,14 +823,19 @@ if session_result is not None:
         elif st.button("원본 해상도 이미지 만들기"):
             with st.spinner("원본 해상도로 LUT를 적용하는 중..."):
                 full_rgb = apply_3d_lut(
-                    rgb_image=session_result["tone_matched_rgb"],
-                    lut_output=current_lut,
+                    rgb_image=apply_3d_lut(
+                        rgb_image=session_result["tone_matched_rgb"],
+                        lut_output=current_lut,
+                        lut_size=result_lut_size,
+                    ),
+                    lut_output=current_luts["skin"],
                     lut_size=result_lut_size,
                 )
 
                 st.session_state["full_resolution"] = {
                     "strength": transfer_strength,
                     "skin": skin_protection,
+                    "skin_correction": current_skin_key,
                     "png": encode_png(full_rgb),
                 }
 

@@ -112,6 +112,13 @@ def build_analysis_summary(
         ),
         "cube_paths": pipeline_result.get("cube_paths"),
         "white_balance": pipeline_result.get("white_balance"),
+        "reference_skin": pipeline_result.get("reference_skin"),
+        "target_skin": pipeline_result.get("target_skin"),
+        "skin_line_hue": pipeline_result.get("skin_line_hue"),
+        "skin_target_used": pipeline_result.get("skin_target_used"),
+        "skin_target_hue": pipeline_result.get("skin_target_hue"),
+        "skin_hue_strength": pipeline_result.get("skin_hue_strength"),
+        "skin_saturation": pipeline_result.get("skin_saturation"),
         "white_balance_diagnostics": pipeline_result.get(
             "white_balance_diagnostics"
         ),

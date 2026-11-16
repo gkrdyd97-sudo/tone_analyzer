@@ -37,6 +37,13 @@ from .primaries import (
     estimate_primaries,
 )
 
+from .skin_tone import (
+    SKIN_LINE_HUE,
+    build_skin_correction_lut,
+    measure_skin,
+    resolve_target_hue,
+)
+
 from .white_balance import (
     apply_white_balance,
     estimate_white_balance,
@@ -61,6 +68,10 @@ def build_final_luts(
     skin_protection,
     primaries_nodes=None,
     white_balance_nodes=None,
+    skin_target_hue=SKIN_LINE_HUE,
+    skin_hue_strength=0.0,
+    skin_saturation=1.0,
+    skin_chroma=None,
 ):
     """
     현재 강도 / 피부 보호 설정으로 내보낼 LUT 3종을 만든다.
@@ -73,7 +84,8 @@ def build_final_luts(
         white_balance : ③ 화이트밸런스만                    (노드 2)
         tone          : ①②③ 를 합친 것
         color         : ④ 컬러 그레이딩 (+ 피부 보호, 강도) (노드 3)
-        combined      : ①②③④ 전부 (원본 소스에 하나만 거는 LUT)
+        skin          : ⑤ 스킨톤 교정                       (노드 4)
+        combined      : ①~⑤ 전부 (원본 소스에 하나만 거는 LUT)
     """
 
     protected = protect_skin_in_lut(
@@ -88,9 +100,22 @@ def build_final_luts(
         strength=transfer_strength,
     )
 
+    skin_lut = build_skin_correction_lut(
+        lut_input=lut_input,
+        target_hue=skin_target_hue,
+        hue_strength=skin_hue_strength,
+        saturation=skin_saturation,
+        skin_chroma=skin_chroma,
+    )
+
+    # ①②③ → ④ → ⑤ 를 하나로 합친다.
     combined_lut = compose_with_tone_stage(
-        tone_stage_nodes=tone_stage_nodes,
-        color_lut_output=color_lut,
+        tone_stage_nodes=compose_with_tone_stage(
+            tone_stage_nodes=tone_stage_nodes,
+            color_lut_output=color_lut,
+            lut_size=lut_size,
+        ),
+        color_lut_output=skin_lut,
         lut_size=lut_size,
     )
 
@@ -107,6 +132,7 @@ def build_final_luts(
         ),
         "tone": np.asarray(tone_stage_nodes, dtype=np.float32),
         "color": color_lut,
+        "skin": skin_lut,
         "combined": combined_lut,
     }
 
@@ -125,6 +151,9 @@ def run_tone_matching_pipeline(
     skin_protection=0.85,
     tone_method="primaries",
     balance_strength=0.5,
+    skin_target_mode="line",
+    skin_hue_strength=0.5,
+    skin_saturation=1.0,
 ):
     """
     전체 톤 매칭 파이프라인.
@@ -135,13 +164,16 @@ def run_tone_matching_pipeline(
     ② Contrast / Pivot      ┘ tone_method="histogram" 이면 히스토그램 매칭 커브로 대체
     ③ 화이트밸런스 (Temp / Tint, 강도 = balance_strength 0~1)
     ④ 컬러 그레이딩 (Reference 색감, 3D LUT) + 피부 보호 / 강도
+    ⑤ 스킨톤 교정 (피부 색상을 스킨톤 라인 또는 Reference 피부 쪽으로, 채도 조절)
+       skin_target_mode = "line" | "reference"
 
     내보내는 .cube
     -------------
-    - target_to_reference_{N}.cube             : ①②③④ 전부 (원본 소스에 하나만 걸기)
+    - target_to_reference_{N}.cube             : ①~⑤ 전부 (원본 소스에 하나만 걸기)
     - target_to_reference_{N}_1_primaries.cube : ①② (노드 1)
     - target_to_reference_{N}_2_wb.cube        : ③   (노드 2)
     - target_to_reference_{N}_3_color.cube     : ④   (노드 3)
+    - target_to_reference_{N}_4_skin.cube      : ⑤   (노드 4)
     """
 
     reference_path = Path(reference_path)
@@ -315,6 +347,31 @@ def run_tone_matching_pipeline(
         tone_stage(lut_input), dtype=np.float32
     )
 
+    # ⑤ 스킨톤 교정 목표
+    #    교정 범위(퀄리파이어)는 ④ 까지 적용한 이미지의 실제 피부 채도를 기준으로 한다.
+    graded_luts = build_final_luts(
+        lut_input=lut_input,
+        tone_stage_nodes=tone_stage_nodes,
+        color_lut_raw=color_lut_raw,
+        lut_size=lut_size,
+        transfer_strength=transfer_strength,
+        skin_protection=skin_protection,
+    )
+
+    target_skin = measure_skin(
+        apply_3d_lut(
+            rgb_image=target_tone_matched_rgb,
+            lut_output=graded_luts["color"],
+            lut_size=lut_size,
+        )
+    )
+
+    reference_skin = measure_skin(reference_rgb)
+    skin_target_hue, skin_target_used = resolve_target_hue(
+        skin_target_mode,
+        reference_skin,
+    )
+
     final_luts = build_final_luts(
         lut_input=lut_input,
         tone_stage_nodes=tone_stage_nodes,
@@ -324,14 +381,24 @@ def run_tone_matching_pipeline(
         skin_protection=skin_protection,
         primaries_nodes=primaries_nodes,
         white_balance_nodes=white_balance_nodes,
+        skin_target_hue=skin_target_hue,
+        skin_hue_strength=skin_hue_strength,
+        skin_saturation=skin_saturation,
+        skin_chroma=target_skin["chroma"],
     )
 
 
     # 7. 결과 이미지 (톤 단계 결과에 색 LUT 적용)
 
-    target_3d_lut_rgb = apply_3d_lut(
+    target_graded_rgb = apply_3d_lut(
         rgb_image=target_tone_matched_rgb,
         lut_output=final_luts["color"],
+        lut_size=lut_size,
+    )
+
+    target_3d_lut_rgb = apply_3d_lut(
+        rgb_image=target_graded_rgb,
+        lut_output=final_luts["skin"],
         lut_size=lut_size,
     )
 
@@ -347,13 +414,15 @@ def run_tone_matching_pipeline(
         "primaries": output_directory / f"target_to_reference_{lut_size}_1_primaries.cube",
         "white_balance": output_directory / f"target_to_reference_{lut_size}_2_wb.cube",
         "color": output_directory / f"target_to_reference_{lut_size}_3_color.cube",
+        "skin": output_directory / f"target_to_reference_{lut_size}_4_skin.cube",
     }
 
     cube_titles = {
-        "combined": "Target to Reference (1-4 all)",
+        "combined": "Target to Reference (1-5 all)",
         "primaries": f"Target to Reference (1-2 primaries: {tone_method})",
         "white_balance": "Target to Reference (3 white balance)",
         "color": "Target to Reference (4 color grading)",
+        "skin": "Target to Reference (5 skin tone)",
     }
 
     save_rgb_image(
@@ -408,6 +477,14 @@ def run_tone_matching_pipeline(
             primaries_result["diagnostics"] if primaries_result else None
         ),
         "white_balance": white_balance,
+        "reference_skin": reference_skin,
+        "target_skin": target_skin,
+        "skin_line_hue": float(SKIN_LINE_HUE),
+        "skin_target_mode": skin_target_mode,
+        "skin_target_used": skin_target_used,
+        "skin_target_hue": float(skin_target_hue),
+        "skin_hue_strength": float(skin_hue_strength),
+        "skin_saturation": float(skin_saturation),
         "white_balance_diagnostics": white_balance_result["diagnostics"],
         "primaries_nodes": primaries_nodes,
         "white_balance_nodes": white_balance_nodes,
