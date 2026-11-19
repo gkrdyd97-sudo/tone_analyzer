@@ -371,6 +371,7 @@ def protect_skin_in_lut(
     lut_input,
     lut_output,
     skin_protection,
+    skin_cluster=None,
 ):
     """
     LUT 격자점 단위로 피부톤을 보호한다.
@@ -396,9 +397,17 @@ def protect_skin_in_lut(
 
     lut_size = int(round(len(lut_input) ** (1.0 / 3.0)))
 
-    skin_weights = compute_skin_weights(lut_input).reshape(
-        lut_size, lut_size, lut_size
-    )
+    if skin_cluster is not None:
+        # 얼굴에서 샘플링한 실제 피부 색 범위만 보호
+        from .skin_tone import cluster_weights, srgb_to_lab
+
+        skin_weights = cluster_weights(
+            srgb_to_lab(lut_input), skin_cluster
+        ).reshape(lut_size, lut_size, lut_size)
+    else:
+        skin_weights = compute_skin_weights(lut_input).reshape(
+            lut_size, lut_size, lut_size
+        )
 
     # 피부색은 RGB 공간에서 얇은 영역이라, 픽셀이 속한 격자 칸의
     # 8개 꼭짓점 중 일부만 피부로 판정되면 보간 과정에서 보호가 흐려진다.

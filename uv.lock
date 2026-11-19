@@ -1845,6 +1845,7 @@ dependencies = [
     { name = "opencv-python" },
     { name = "pandas" },
     { name = "scikit-learn" },
+    { name = "scipy" },
     { name = "streamlit" },
 ]
 
@@ -1856,6 +1857,7 @@ requires-dist = [
     { name = "opencv-python", specifier = ">=5.0.0.93" },
     { name = "pandas", specifier = ">=3.1.1" },
     { name = "scikit-learn", specifier = ">=1.9.1" },
+    { name = "scipy", specifier = ">=1.15" },
     { name = "streamlit", specifier = ">=1.67.0" },
 ]
 

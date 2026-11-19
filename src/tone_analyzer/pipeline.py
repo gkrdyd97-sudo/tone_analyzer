@@ -37,11 +37,18 @@ from .primaries import (
     estimate_primaries,
 )
 
+from .lut import apply_3d_lut_to_pixels
+
 from .skin_tone import (
     SKIN_LINE_HUE,
     build_skin_correction_lut,
-    measure_skin,
+    detect_faces,
+    measure_skin_samples,
     resolve_target_hue,
+    sample_face_pixels,
+    skin_cluster_from_pixels,
+    skin_leakage,
+    srgb_to_lab,
 )
 
 from .white_balance import (
@@ -72,9 +79,14 @@ def build_final_luts(
     skin_hue_strength=0.0,
     skin_saturation=1.0,
     skin_chroma=None,
+    skin_samples=None,
 ):
     """
-    현재 강도 / 피부 보호 설정으로 내보낼 LUT 3종을 만든다.
+    현재 강도 / 피부 보호 설정으로 내보낼 LUT 를 만든다.
+
+    skin_samples : ①②③ 까지 적용한 이미지의 얼굴 피부 픽셀 (N, 3) 0~1.
+        - ④ 피부 보호는 이 색 범위만 보호하고
+        - ⑤ 교정은 이 샘플을 ④ 에 통과시킨 '그레이딩 후 피부' 색 범위만 교정한다.
     (앱에서 슬라이더를 움직일 때도 이 함수로 즉시 다시 계산한다)
 
     Returns
@@ -86,12 +98,20 @@ def build_final_luts(
         color         : ④ 컬러 그레이딩 (+ 피부 보호, 강도) (노드 3)
         skin          : ⑤ 스킨톤 교정                       (노드 4)
         combined      : ①~⑤ 전부 (원본 소스에 하나만 거는 LUT)
+        skin_hue_before / skin_hue_after : ⑤ 전후 피부 색상각 (샘플 기준)
     """
+
+    has_samples = skin_samples is not None and len(skin_samples) >= 50
+
+    pre_grade_cluster = (
+        skin_cluster_from_pixels(skin_samples) if has_samples else None
+    )
 
     protected = protect_skin_in_lut(
         lut_input=lut_input,
         lut_output=color_lut_raw,
         skin_protection=skin_protection,
+        skin_cluster=pre_grade_cluster,
     )
 
     color_lut = blend_lut_with_identity(
@@ -100,12 +120,36 @@ def build_final_luts(
         strength=transfer_strength,
     )
 
+    # ④ 를 통과한 뒤 피부가 어디로 갔는지 → ⑤ 의 퀄리파이어
+    graded_samples = (
+        apply_3d_lut_to_pixels(skin_samples, color_lut, lut_size)
+        if has_samples else None
+    )
+
+    graded_cluster = (
+        skin_cluster_from_pixels(graded_samples) if has_samples else None
+    )
+
     skin_lut = build_skin_correction_lut(
         lut_input=lut_input,
         target_hue=skin_target_hue,
         hue_strength=skin_hue_strength,
         saturation=skin_saturation,
         skin_chroma=skin_chroma,
+        skin_cluster=graded_cluster,
+    )
+
+    def samples_hue(samples):
+        if samples is None:
+            return None
+        lab = srgb_to_lab(samples)
+        return float(np.degrees(np.arctan2(
+            np.median(lab[:, 2]), np.median(lab[:, 1])
+        )))
+
+    corrected_samples = (
+        apply_3d_lut_to_pixels(graded_samples, skin_lut, lut_size)
+        if has_samples else None
     )
 
     # ①②③ → ④ → ⑤ 를 하나로 합친다.
@@ -134,6 +178,9 @@ def build_final_luts(
         "color": color_lut,
         "skin": skin_lut,
         "combined": combined_lut,
+        "skin_hue_before": samples_hue(graded_samples),
+        "skin_hue_after": samples_hue(corrected_samples),
+        "skin_cluster_graded": graded_cluster,
     }
 
 
@@ -150,7 +197,8 @@ def run_tone_matching_pipeline(
     tonal_regions=True,
     skin_protection=0.85,
     tone_method="primaries",
-    balance_strength=0.5,
+    balance_strength=0.7,
+    white_balance_mode="neutral",
     skin_target_mode="line",
     skin_hue_strength=0.5,
     skin_saturation=1.0,
@@ -163,6 +211,7 @@ def run_tone_matching_pipeline(
     ① Lift / Gamma / Gain   ┐ tone_method="primaries" (기본)
     ② Contrast / Pivot      ┘ tone_method="histogram" 이면 히스토그램 매칭 커브로 대체
     ③ 화이트밸런스 (Temp / Tint, 강도 = balance_strength 0~1)
+       white_balance_mode = "neutral" (중성색을 회색으로) | "reference" (Reference 중성색에 맞춤)
     ④ 컬러 그레이딩 (Reference 색감, 3D LUT) + 피부 보호 / 강도
     ⑤ 스킨톤 교정 (피부 색상을 스킨톤 라인 또는 Reference 피부 쪽으로, 채도 조절)
        skin_target_mode = "line" | "reference"
@@ -270,10 +319,20 @@ def run_tone_matching_pipeline(
 
     # ③ 화이트밸런스 (①② 결과 기준으로 추정)
 
+    # 얼굴은 위치만 쓰므로 원본에서 한 번만 찾는다.
+    target_faces = detect_faces(target_rgb)
+
+    # 피부는 중성색 후보에서 빼기 위해 ①② 이후 피부 색 범위를 구해 둔다.
+    primaries_skin_cluster = skin_cluster_from_pixels(
+        sample_face_pixels(target_primaries_rgb, target_faces)
+    )
+
     white_balance_result = estimate_white_balance(
         target_rgb=target_primaries_rgb,
         reference_rgb=reference_rgb,
         strength=balance_strength,
+        mode=white_balance_mode,
+        skin_cluster=primaries_skin_cluster,
     )
 
     white_balance = white_balance_result["white_balance"]
@@ -347,26 +406,20 @@ def run_tone_matching_pipeline(
         tone_stage(lut_input), dtype=np.float32
     )
 
-    # ⑤ 스킨톤 교정 목표
-    #    교정 범위(퀄리파이어)는 ④ 까지 적용한 이미지의 실제 피부 채도를 기준으로 한다.
-    graded_luts = build_final_luts(
-        lut_input=lut_input,
-        tone_stage_nodes=tone_stage_nodes,
-        color_lut_raw=color_lut_raw,
-        lut_size=lut_size,
-        transfer_strength=transfer_strength,
-        skin_protection=skin_protection,
+    # ④⑤ 피부: ①②③ 이후 이미지의 얼굴에서 피부 샘플링 (없으면 색 기반)
+    target_skin, target_skin_samples = measure_skin_samples(
+        target_tone_matched_rgb,
+        faces=target_faces,
     )
 
-    target_skin = measure_skin(
-        apply_3d_lut(
-            rgb_image=target_tone_matched_rgb,
-            lut_output=graded_luts["color"],
-            lut_size=lut_size,
-        )
+    reference_skin, _ = measure_skin_samples(reference_rgb)
+
+    target_skin["leakage"] = skin_leakage(
+        target_tone_matched_rgb,
+        skin_cluster_from_pixels(target_skin_samples),
+        target_faces if target_skin["source"] == "face" else [],
     )
 
-    reference_skin = measure_skin(reference_rgb)
     skin_target_hue, skin_target_used = resolve_target_hue(
         skin_target_mode,
         reference_skin,
@@ -384,7 +437,7 @@ def run_tone_matching_pipeline(
         skin_target_hue=skin_target_hue,
         skin_hue_strength=skin_hue_strength,
         skin_saturation=skin_saturation,
-        skin_chroma=target_skin["chroma"],
+        skin_samples=target_skin_samples,
     )
 
 
@@ -479,6 +532,9 @@ def run_tone_matching_pipeline(
         "white_balance": white_balance,
         "reference_skin": reference_skin,
         "target_skin": target_skin,
+        "target_skin_samples": target_skin_samples,
+        "target_faces": target_faces,
+        "white_balance_mode": white_balance_mode,
         "skin_line_hue": float(SKIN_LINE_HUE),
         "skin_target_mode": skin_target_mode,
         "skin_target_used": skin_target_used,

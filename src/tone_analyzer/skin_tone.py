@@ -192,12 +192,334 @@ def measure_skin(
     }
 
 
+# ─────────────────────────────────────────
+# 얼굴 인식 기반 피부 샘플링
+# ─────────────────────────────────────────
+
+FACE_MODEL_PATH = (
+    __import__("pathlib").Path(__file__).resolve().parent
+    / "models"
+    / "face_detection_yunet_2023mar.onnx"
+)
+
+
+def detect_faces(rgb_image, max_side=1280, score_threshold=0.6):
+    """
+    YuNet 으로 얼굴을 찾는다. 원본 좌표계의 (x, y, w, h, score) 목록을 돌려준다.
+    모델이나 OpenCV 기능이 없으면 빈 목록 (색 기반 추정으로 대체된다).
+    """
+
+    validate_rgb_image(rgb_image)
+
+    if not FACE_MODEL_PATH.exists() or not hasattr(cv2, "FaceDetectorYN"):
+        return []
+
+    height, width = rgb_image.shape[:2]
+    scale = min(1.0, max_side / max(height, width))
+
+    small = cv2.resize(
+        rgb_image,
+        (int(round(width * scale)), int(round(height * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
+
+    bgr = cv2.cvtColor(small, cv2.COLOR_RGB2BGR)
+
+    detector = cv2.FaceDetectorYN.create(
+        str(FACE_MODEL_PATH),
+        "",
+        (bgr.shape[1], bgr.shape[0]),
+        score_threshold=score_threshold,
+    )
+
+    _, faces = detector.detect(bgr)
+
+    if faces is None:
+        return []
+
+    return [
+        (
+            float(face[0] / scale),
+            float(face[1] / scale),
+            float(face[2] / scale),
+            float(face[3] / scale),
+            float(face[14]),
+        )
+        for face in faces
+    ]
+
+
+def sample_face_pixels(rgb_image, faces, max_samples=8000, random_seed=42):
+    """
+    얼굴 상자 안쪽 타원(볼·이마·코 부위)에서 피부 픽셀을 뽑는다.
+
+    - 눈썹·눈·머리카락(아주 어두운 픽셀)과 배경(피부와 동떨어진 색)을 거르고
+    - 중앙값에서 크게 벗어난 색(입술, 그림자 끝)을 한 번 더 걸러낸다.
+
+    Returns
+    -------
+    (N, 3) 0~1 RGB. 얼굴이 없거나 샘플이 너무 적으면 None.
+    """
+
+    if not faces:
+        return None
+
+    height, width = rgb_image.shape[:2]
+    collected = []
+
+    for x, y, w, h, _ in faces:
+        center_x = x + w * 0.5
+        center_y = y + h * 0.55
+        radius_x = w * 0.32
+        radius_y = h * 0.36
+
+        x0, x1 = int(max(center_x - radius_x, 0)), int(min(center_x + radius_x + 1, width))
+        y0, y1 = int(max(center_y - radius_y, 0)), int(min(center_y + radius_y + 1, height))
+
+        if x1 - x0 < 3 or y1 - y0 < 3:
+            continue
+
+        grid_y, grid_x = np.mgrid[y0:y1, x0:x1]
+        inside = (
+            ((grid_x - center_x) / radius_x) ** 2
+            + ((grid_y - center_y) / radius_y) ** 2
+        ) <= 1.0
+
+        collected.append(rgb_image[y0:y1, x0:x1][inside])
+
+    if not collected:
+        return None
+
+    pixels = np.concatenate(collected).astype(np.float64) / 255.0
+
+    lab = srgb_to_lab(pixels)
+    chroma = np.hypot(lab[:, 1], lab[:, 2])
+
+    # 너무 어둡거나(눈·눈썹·머리카락) 날아간 픽셀, 무채색 제외
+    keep = (lab[:, 0] > 15.0) & (lab[:, 0] < 97.0) & (chroma > 2.0)
+    pixels, lab = pixels[keep], lab[keep]
+
+    if len(pixels) < 50:
+        return None
+
+    # 중앙값 기준 a, b 이상치 제거 (입술, 배경 섞임)
+    median_ab = np.median(lab[:, 1:], axis=0)
+    distance = np.linalg.norm(lab[:, 1:] - median_ab, axis=1)
+    limit = np.median(distance) * 2.5 + 1.0
+    pixels = pixels[distance <= limit]
+
+    if len(pixels) < 50:
+        return None
+
+    if len(pixels) > max_samples:
+        random_generator = np.random.default_rng(random_seed)
+        pixels = pixels[
+            random_generator.choice(len(pixels), max_samples, replace=False)
+        ]
+
+    return pixels
+
+
+def color_based_skin_pixels(rgb_image, max_samples=8000, random_seed=42):
+    """
+    얼굴을 찾지 못했을 때의 대체: 색 기준 피부 가중치가 높은 픽셀.
+    """
+
+    pixels = rgb_image.reshape(-1, 3).astype(np.float64) / 255.0
+    random_generator = np.random.default_rng(random_seed)
+
+    if len(pixels) > 200_000:
+        pixels = pixels[random_generator.choice(len(pixels), 200_000, replace=False)]
+
+    weights = skin_weights_from_lab(srgb_to_lab(pixels))
+    pixels = pixels[weights > 0.5]
+
+    if len(pixels) < 50:
+        return None
+
+    if len(pixels) > max_samples:
+        pixels = pixels[random_generator.choice(len(pixels), max_samples, replace=False)]
+
+    return pixels
+
+
+def skin_cluster_from_pixels(pixels):
+    """
+    피부 샘플의 색 범위(퀄리파이어)를 만든다.
+
+    Returns
+    -------
+    dict 또는 None
+        hue, hue_width : 색상 중심과 허용 폭(도)
+        chroma, chroma_low, chroma_high
+        lightness_low, lightness_high
+    """
+
+    if pixels is None or len(pixels) < 50:
+        return None
+
+    lab = srgb_to_lab(pixels)
+    hue = np.degrees(np.arctan2(lab[:, 2], lab[:, 1]))
+    chroma = np.hypot(lab[:, 1], lab[:, 2])
+
+    center = _circular_weighted_mean(hue, np.ones(len(hue)))
+    deviation = np.abs((hue - center + 180.0) % 360.0 - 180.0)
+
+    # 얼굴 박스에는 그림자 끝, 손, 머리카락 경계가 섞이므로
+    # 양 끝을 잘라낸 '중심부' 분포로 범위를 잡는다.
+    chroma_low, chroma_mid, chroma_high = np.percentile(chroma, [20, 50, 80])
+    lightness_low, lightness_high = np.percentile(lab[:, 0], [10, 90])
+
+    return {
+        "hue": float(center),
+        "hue_width": float(np.clip(np.percentile(deviation, 75) * 1.6, 8.0, 20.0)),
+        "chroma": float(chroma_mid),
+        "chroma_low": float(max(chroma_low * 0.75, 0.0)),
+        "chroma_high": float(chroma_high * 1.2 + 1.5),
+        "lightness_low": float(max(lightness_low - 6.0, 0.0)),
+        "lightness_high": float(min(lightness_high + 6.0, 100.0)),
+        "sample_count": int(len(pixels)),
+    }
+
+
+def cluster_weights(lab, cluster):
+    """
+    피부 색 범위(cluster) 안에 있을수록 1 에 가까운 부드러운 가중치.
+    """
+
+    hue = np.degrees(np.arctan2(lab[:, 2], lab[:, 1]))
+    chroma = np.hypot(lab[:, 1], lab[:, 2])
+    deviation = np.abs((hue - cluster["hue"] + 180.0) % 360.0 - 180.0)
+
+    width = cluster["hue_width"]
+    hue_weight = 1.0 - _smoothstep(width * 0.6, width, deviation)
+
+    chroma_weight = (
+        _smoothstep(cluster["chroma_low"] - 3.0, cluster["chroma_low"], chroma)
+        * (1.0 - _smoothstep(cluster["chroma_high"], cluster["chroma_high"] + 6.0, chroma))
+    )
+
+    lightness_weight = (
+        _smoothstep(cluster["lightness_low"] - 8.0, cluster["lightness_low"], lab[:, 0])
+        * (1.0 - _smoothstep(cluster["lightness_high"], cluster["lightness_high"] + 8.0, lab[:, 0]))
+    )
+
+    return hue_weight * chroma_weight * lightness_weight
+
+
+def skin_mask_from_cluster(rgb_image, cluster):
+    """
+    (H, W) uint8 피부 마스크 (UI 확인용).
+    """
+
+    height, width = rgb_image.shape[:2]
+
+    if cluster is None:
+        weights = skin_weights_from_lab(
+            srgb_to_lab(rgb_image.reshape(-1, 3).astype(np.float64) / 255.0)
+        )
+    else:
+        weights = cluster_weights(
+            srgb_to_lab(rgb_image.reshape(-1, 3).astype(np.float64) / 255.0),
+            cluster,
+        )
+
+    return (weights.reshape(height, width) * 255.0).astype(np.uint8)
+
+
+def skin_leakage(rgb_image, cluster, faces, max_side=640):
+    """
+    피부 색 범위에 해당하는 영역 중 '얼굴 밖'의 비율 (이미지 전체 대비).
+
+    값이 크면 배경에 피부와 같은 색이 많다는 뜻이고,
+    LUT 는 위치를 구분하지 못하므로 피부 보호/교정이 배경에도 적용된다.
+    """
+
+    if cluster is None:
+        return None
+
+    height, width = rgb_image.shape[:2]
+    scale = min(1.0, max_side / max(height, width))
+    small = cv2.resize(
+        rgb_image,
+        (int(round(width * scale)), int(round(height * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
+
+    weights = cluster_weights(
+        srgb_to_lab(small.reshape(-1, 3).astype(np.float64) / 255.0),
+        cluster,
+    ).reshape(small.shape[:2])
+
+    face_mask = np.zeros(small.shape[:2], dtype=bool)
+
+    for x, y, w, h, _ in faces or []:
+        # 얼굴 아래 목/손까지 여유 있게 포함
+        x0 = int(max((x - w * 0.3) * scale, 0))
+        x1 = int(min((x + w * 1.3) * scale, small.shape[1]))
+        y0 = int(max((y - h * 0.2) * scale, 0))
+        y1 = int(min((y + h * 1.8) * scale, small.shape[0]))
+        face_mask[y0:y1, x0:x1] = True
+
+    return float((weights * ~face_mask).mean())
+
+
+def measure_skin_samples(rgb_image, faces=None):
+    """
+    피부 샘플과 정보를 얻는다. 얼굴 인식 우선, 실패하면 색 기반.
+
+    Returns
+    -------
+    (info, samples)
+        info    : {"source": "face"|"color"|None, "face_count", "hue", "chroma"}
+        samples : (N, 3) 0~1 RGB 또는 None
+    """
+
+    if faces is None:
+        faces = detect_faces(rgb_image)
+
+    samples = sample_face_pixels(rgb_image, faces)
+    source = "face"
+
+    if samples is None:
+        samples = color_based_skin_pixels(rgb_image)
+        source = "color" if samples is not None else None
+
+    cluster = skin_cluster_from_pixels(samples)
+
+    info = {
+        "source": source,
+        "face_count": int(len(faces)),
+        "hue": cluster["hue"] if cluster else None,
+        "chroma": cluster["chroma"] if cluster else None,
+    }
+
+    return info, samples
+
+
+MIN_RELIABLE_SKIN_CHROMA = 6.0
+
+
+def is_reliable_skin(skin_info):
+    """
+    측정한 피부가 목표로 쓸 만한지.
+    얼굴이 너무 어둡거나(후드, 역광) 무채색에 가까우면 색상각을 믿을 수 없다.
+    """
+
+    return (
+        skin_info is not None
+        and skin_info.get("hue") is not None
+        and (skin_info.get("chroma") or 0.0) >= MIN_RELIABLE_SKIN_CHROMA
+    )
+
+
 def resolve_target_hue(mode, reference_skin):
     """
     교정 목표 색상각과 실제로 쓰인 기준을 돌려준다.
+    Reference 피부를 믿을 수 없으면 스킨톤 라인을 쓴다.
     """
 
-    if mode == "reference" and reference_skin.get("hue") is not None:
+    if mode == "reference" and is_reliable_skin(reference_skin):
         return reference_skin["hue"], "reference"
 
     return SKIN_LINE_HUE, "line"
@@ -276,9 +598,13 @@ def build_skin_correction_lut(
     hue_strength,
     saturation,
     skin_chroma=None,
+    skin_cluster=None,
 ):
     """
     ⑤ 스킨톤 교정 LUT (노드 4).
+
+    skin_cluster : ④ 이후 실제 얼굴 피부의 색 범위. 있으면 이 범위만 교정한다.
+                   (없으면 넓은 색 기준 퀄리파이어 사용)
 
     skin_chroma : ④ 까지 적용한 이미지의 피부 평균 채도.
                   이보다 훨씬 진한 색(입술 등)은 교정하지 않는다.
@@ -292,7 +618,10 @@ def build_skin_correction_lut(
 
     # 피부 '보호'와 달리 가중치를 이웃 격자로 넓히지 않는다.
     # 넓히면 바로 옆 색인 입술까지 끌려가고, 교정은 경계가 부드러워도 괜찮다.
-    weights = correction_qualifier(srgb_to_lab(lut_input), skin_chroma)
+    if skin_cluster is not None:
+        weights = cluster_weights(srgb_to_lab(lut_input), skin_cluster)
+    else:
+        weights = correction_qualifier(srgb_to_lab(lut_input), skin_chroma)
 
     return correct_skin_pixels(
         lut_input,

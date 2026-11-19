@@ -34,10 +34,6 @@ if str(SRC_PATH) not in sys.path:
     )
 
 
-from tone_analyzer.color_matching import (
-    compute_skin_mask,
-)
-
 from tone_analyzer.lut import (
     apply_3d_lut,
     make_cube_text,
@@ -59,7 +55,9 @@ from tone_analyzer.white_balance import (
 
 from tone_analyzer.skin_tone import (
     SKIN_LINE_HUE,
-    measure_skin,
+    is_reliable_skin,
+    skin_mask_from_cluster,
+    skin_cluster_from_pixels,
     render_vectorscope,
 )
 
@@ -135,16 +133,30 @@ tone_method = st.sidebar.selectbox(
 )
 
 
+white_balance_mode = st.sidebar.radio(
+    "③ 화이트밸런스 기준",
+    options=["neutral", "reference"],
+    format_func=lambda value: {
+        "neutral": "중성색을 회색으로 (밸런스 보정)",
+        "reference": "Reference 의 중성색에 맞춤",
+    }[value],
+    help=(
+        "밸런스 보정: 회색이어야 할 부분을 실제 회색으로 맞춥니다. "
+        "룩의 색감은 ④ 가 담당합니다 (컬러리스트 작업 순서). "
+        "Reference 맞춤: Reference 의 회색에 섞인 색감까지 따라갑니다."
+    ),
+)
+
+
 balance_strength = st.sidebar.slider(
     "③ 화이트밸런스 강도",
     min_value=0.0,
     max_value=1.0,
-    value=0.5,
+    value=0.7,
     step=0.05,
     help=(
-        "중성색(회색 계열)의 색을 Reference 쪽으로 옮기는 정도. "
-        "Reference 의 중성색에는 룩의 색감이 섞여 있을 수 있어 기본 0.5. "
-        "0이면 화이트밸런스를 건드리지 않습니다."
+        "목표 쪽으로 옮기는 정도. 1 이면 중성색을 완전히 회색으로 맞춥니다. "
+        "조명의 의도된 색(텅스텐의 따뜻함 등)을 조금 남기려면 0.6~0.8."
     ),
 )
 
@@ -415,6 +427,7 @@ if run_button:
                     skin_saturation=skin_saturation,
                     tone_method=tone_method,
                     balance_strength=balance_strength,
+                    white_balance_mode=white_balance_mode,
                 )
             )
 
@@ -437,7 +450,12 @@ if run_button:
             "primaries_preview_rgb": make_preview(
                 pipeline_result["target_primaries_rgb"]
             ),
-            "skin_mask_preview": compute_skin_mask(preview_rgb),
+            "skin_mask_preview": skin_mask_from_cluster(
+                preview_rgb,
+                skin_cluster_from_pixels(
+                    pipeline_result.get("target_skin_samples")
+                ),
+            ),
             "lut_size": lut_size,
         }
 
@@ -473,7 +491,7 @@ if session_result is not None:
 
     reference_skin = pipeline_result.get("reference_skin") or {}
 
-    if skin_target_mode == "reference" and reference_skin.get("hue") is not None:
+    if skin_target_mode == "reference" and is_reliable_skin(reference_skin):
         skin_target_hue = reference_skin["hue"]
         skin_target_label = "Reference 피부"
     else:
@@ -481,8 +499,8 @@ if session_result is not None:
         skin_target_label = "스킨톤 라인"
         if skin_target_mode == "reference":
             st.info(
-                "Reference 이미지에서 피부를 충분히 찾지 못해 "
-                "스킨톤 라인을 목표로 사용합니다."
+                "Reference 의 피부를 믿을 만하게 측정하지 못해 "
+                "(얼굴이 없거나 너무 어둡거나 무채색) 스킨톤 라인을 목표로 사용합니다."
             )
 
     current_luts = build_final_luts(
@@ -497,7 +515,7 @@ if session_result is not None:
         skin_target_hue=skin_target_hue,
         skin_hue_strength=skin_hue_strength,
         skin_saturation=skin_saturation,
-        skin_chroma=(pipeline_result.get("target_skin") or {}).get("chroma"),
+        skin_samples=pipeline_result.get("target_skin_samples"),
     )
 
     current_lut = current_luts["color"]
@@ -540,9 +558,17 @@ if session_result is not None:
         help="LUT가 색 전이 결과를 얼마나 잘 따라가는지 (낮을수록 좋음)",
     )
 
+    target_skin_info = pipeline_result.get("target_skin") or {}
+
     metric_cols[3].metric(
-        "피부 추정 비율",
-        f"{pipeline_result['skin_ratio'] * 100:.1f}%",
+        "피부 인식",
+        (
+            f"얼굴 {target_skin_info.get('face_count', 0)}개"
+            if target_skin_info.get("source") == "face"
+            else "색 기반 추정"
+            if target_skin_info.get("source") == "color"
+            else "없음"
+        ),
     )
 
 
@@ -586,8 +612,32 @@ if session_result is not None:
         "⑤ 스킨톤"
     )
 
-    skin_before = measure_skin(preview_graded)
-    skin_after = measure_skin(preview_after)
+    target_skin = pipeline_result.get("target_skin") or {}
+
+    skin_before = {"hue": current_luts.get("skin_hue_before")}
+    skin_after = {"hue": current_luts.get("skin_hue_after")}
+
+    if target_skin.get("source") == "face":
+        st.caption(
+            f"얼굴 {target_skin.get('face_count', 0)}개에서 피부를 샘플링해 "
+            "④ 피부 보호와 ⑤ 교정 범위를 정했습니다."
+        )
+    elif target_skin.get("source") == "color":
+        st.warning(
+            "얼굴을 찾지 못해 색만으로 피부를 추정했습니다. "
+            "피부와 비슷한 색의 배경도 피부로 처리될 수 있습니다."
+        )
+    else:
+        st.info("피부를 찾지 못해 ④ 피부 보호와 ⑤ 교정을 넓은 기본 범위로 처리합니다.")
+
+    leakage = target_skin.get("leakage")
+
+    if leakage is not None and leakage > 0.05:
+        st.warning(
+            f"배경에 피부와 같은 색이 많습니다 (화면의 약 {leakage * 100:.0f}%). "
+            "LUT 는 위치를 구분하지 못하므로 피부 보호·교정이 그 배경에도 적용됩니다. "
+            "이런 장면은 ⑤ 강도를 낮추거나, DaVinci 에서 윈도우와 함께 퀄리파이어로 작업하세요."
+        )
 
     def format_hue(value):
         return "-" if value is None else f"{value:.1f}°"
@@ -613,13 +663,17 @@ if session_result is not None:
     )
     skin_cols[3].metric(
         "Reference 피부 색상",
-        format_hue(reference_skin.get("hue")),
+        (
+            format_hue(reference_skin.get("hue"))
+            if is_reliable_skin(reference_skin)
+            else "측정 불가"
+        ),
     )
 
     st.caption(
         "Lab 색상각 기준 (0° = 마젠타/분홍 쪽, 90° = 노랑 쪽). "
         f"스킨톤 라인은 약 {SKIN_LINE_HUE:.0f}° 입니다. "
-        "피부는 색만으로 판단하므로 같은 색의 배경도 함께 바뀔 수 있습니다."
+        "피부 색상은 얼굴 샘플 기준입니다."
     )
 
     scope_cols = st.columns(2)
@@ -643,14 +697,35 @@ if session_result is not None:
     )
 
 
-    with st.expander("피부 보호 마스크 보기"):
-        st.caption(
-            "흰색일수록 피부로 판단되어 색 변화가 줄어드는 영역입니다."
-        )
+    with st.expander("피부 인식 확인 (얼굴 위치 / 피부 마스크)"):
+        mask_cols = st.columns(2)
 
-        st.image(
-            session_result["skin_mask_preview"],
-            width="stretch",
+        with mask_cols[0]:
+            st.write("인식한 얼굴")
+            boxed = session_result["preview_rgb"].copy()
+            scale = boxed.shape[1] / pipeline_result["target_rgb"].shape[1]
+
+            for x, y, w, h, _ in pipeline_result.get("target_faces") or []:
+                cv2.rectangle(
+                    boxed,
+                    (int(x * scale), int(y * scale)),
+                    (int((x + w) * scale), int((y + h) * scale)),
+                    (0, 255, 0),
+                    max(2, boxed.shape[1] // 400),
+                )
+
+            st.image(boxed, width="stretch")
+
+        with mask_cols[1]:
+            st.write("피부 마스크 (④ 보호 / ⑤ 교정 범위)")
+            st.image(
+                session_result["skin_mask_preview"],
+                width="stretch",
+            )
+
+        st.caption(
+            "흰색일수록 피부로 처리됩니다. 얼굴 밖에 흰 영역이 많으면 "
+            "그 부분도 피부와 같은 색이라 함께 보정됩니다."
         )
 
 

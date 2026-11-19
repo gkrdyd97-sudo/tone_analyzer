@@ -4,8 +4,12 @@
 """
 ③ 화이트밸런스 (Temp / Tint) 추정.
 
-LGG / Contrast 로 계조를 맞춘 이미지에서
-'원래 회색이어야 할' 저채도 픽셀(중성색)의 색을 Reference 쪽으로 옮긴다.
+LGG / Contrast 로 계조를 맞춘 이미지에서 '원래 회색이어야 할' 저채도 픽셀(중성색)을 찾고
+
+- mode="neutral"   (기본): 중성색을 실제 회색(Lab a = b = 0) 쪽으로 보정한다.
+                           컬러리스트의 밸런스 작업. 룩의 색감은 ④ 가 담당한다.
+- mode="reference"       : 중성색을 Reference 의 중성색 쪽으로 옮긴다.
+                           (Reference 의 회색에 섞인 룩 색감까지 따라간다)
 
 수식
 ----
@@ -96,18 +100,22 @@ def _lab_ab(pixels):
     return np.stack([a, b], axis=1)
 
 
-def _neutral_mask(pixels, neutral_percentile=20.0):
+def _neutral_mask(pixels, neutral_percentile=20.0, exclude_weights=None):
     """
-    중성색 후보: 너무 어둡거나 밝지 않고(루마 20~95%),
+    중성색 후보: 너무 어둡거나 밝지 않고(루마 20~97%, 거의 흰색 제외),
     상대 채도((max - min) / max)가 낮은 하위 neutral_percentile % 픽셀.
 
     절대 채도(max - min)를 쓰면 어두운 픽셀이 무조건 '무채색'으로 뽑혀
     밸런스가 섀도우 노이즈에 끌려가므로 상대 채도를 쓴다.
+    exclude_weights 가 주어지면(피부 등) 0.3 이상인 픽셀은 후보에서 뺀다.
     """
 
     luma_values = luma(pixels)
-    low, high = np.percentile(luma_values, [20.0, 95.0])
-    in_range = (luma_values > low) & (luma_values < high)
+    low, high = np.percentile(luma_values, [20.0, 97.0])
+    in_range = (luma_values > low) & (luma_values < high) & (pixels.max(axis=1) < 0.985)
+
+    if exclude_weights is not None:
+        in_range &= exclude_weights < 0.3
 
     maximum = pixels.max(axis=1)
     saturation = (maximum - pixels.min(axis=1)) / (maximum + 1e-4)
@@ -119,7 +127,9 @@ def _neutral_mask(pixels, neutral_percentile=20.0):
 def estimate_white_balance(
     target_rgb,
     reference_rgb,
-    strength=0.5,
+    strength=0.7,
+    mode="neutral",
+    skin_cluster=None,
     sample_count=60_000,
     random_seed=42,
 ):
@@ -129,9 +139,12 @@ def estimate_white_balance(
     Parameters
     ----------
     strength : 0~1
-        중성색을 Reference 쪽으로 얼마나 옮길지.
-        Reference 의 '중성색'에는 룩의 색감(예: 틸 그레이딩)이 섞여 있을 수 있으므로
-        기본값 0.5 로 절반만 옮기고, 나머지 룩은 ④ 컬러 그레이딩 단계가 맡는다.
+        목표 쪽으로 얼마나 옮길지. neutral 모드에서 1 이면 중성색을 완전히 회색으로.
+        조명의 의도된 색(텅스텐의 따뜻함 등)을 조금 남기도록 기본 0.7.
+
+    mode : "neutral" | "reference"
+
+    skin_cluster : 피부 색 범위. 피부는 중성색 후보에서 뺀다.
     """
 
     validate_rgb_image(target_rgb)
@@ -142,14 +155,29 @@ def estimate_white_balance(
     target_pixels = sample_pixels(target_rgb, sample_count, random_generator)
     reference_pixels = sample_pixels(reference_rgb, sample_count, random_generator)
 
-    target_neutrals = target_pixels[_neutral_mask(target_pixels)]
+    exclude = None
+
+    if skin_cluster is not None:
+        from .skin_tone import cluster_weights, srgb_to_lab
+
+        exclude = cluster_weights(srgb_to_lab(target_pixels), skin_cluster)
+
+    target_neutrals = target_pixels[_neutral_mask(target_pixels, exclude_weights=exclude)]
     reference_neutrals = reference_pixels[_neutral_mask(reference_pixels)]
 
     target_ab = np.median(_lab_ab(target_neutrals), axis=0)
     reference_ab = np.median(_lab_ab(reference_neutrals), axis=0)
 
     strength = float(np.clip(strength, 0.0, 1.0))
-    goal_ab = target_ab + (reference_ab - target_ab) * strength
+
+    if mode == "reference":
+        destination_ab = reference_ab
+    elif mode == "neutral":
+        destination_ab = np.zeros(2)
+    else:
+        raise ValueError("mode는 'neutral' 또는 'reference' 여야 합니다.")
+
+    goal_ab = target_ab + (destination_ab - target_ab) * strength
 
     def residuals(vector):
         balanced = apply_white_balance(
@@ -158,13 +186,13 @@ def estimate_white_balance(
         )
         return np.concatenate([
             np.median(_lab_ab(balanced), axis=0) - goal_ab,
-            vector * 2.0,       # 과한 보정 억제
+            vector * 0.5,       # 과한 보정 억제
         ])
 
     solution = least_squares(
         residuals,
         np.zeros(2),
-        bounds=(np.array([-0.3, -0.3]), np.array([0.3, 0.3])),
+        bounds=(np.array([-0.4, -0.4]), np.array([0.4, 0.4])),
         diff_step=1e-3,
         max_nfev=200,
     )
@@ -190,6 +218,7 @@ def estimate_white_balance(
         "neutral_ab_goal": goal_ab.tolist(),
         "neutral_ab_after": balanced_ab.tolist(),
         "neutral_pixel_count": int(len(target_neutrals)),
+        "mode": mode,
     }
 
     return {
