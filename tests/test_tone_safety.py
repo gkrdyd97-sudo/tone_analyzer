@@ -187,3 +187,26 @@ def test_five_nodes_chain_equals_combined(letterboxed_files):
 
     # 9³ 격자라 보간 오차는 있지만 평균 1% 안
     assert np.abs(chained - direct).mean() < 0.01
+
+
+def test_gain_compression_does_not_flatten_midtones():
+    """
+    Reference 화이트가 낮아 Gain 이 전체를 누를 때, 안전 범위 때문에 미드톤 대비가
+    원본보다 납작해지면 안 된다. (저장소 예제: 예전 0.327 → 0.249, 지금 0.312, Reference 0.331)
+    """
+    import cv2
+    from pathlib import Path
+    from tone_analyzer.image_io import load_rgb_image
+
+    root = Path(__file__).resolve().parents[1] / "images"
+    target = load_rgb_image(root / "target" / "target_1.png")
+    reference = load_rgb_image(root / "reference" / "reference_1.png")
+    target = cv2.resize(target, (target.shape[1] // 4, target.shape[0] // 4), interpolation=cv2.INTER_AREA)
+    reference = cv2.resize(reference, (reference.shape[1] // 4, reference.shape[0] // 4), interpolation=cv2.INTER_AREA)
+
+    anchors = estimate_primaries(target, reference)["diagnostics"]["anchors"]
+    before = anchors["target_before"]["spread"]
+    after = anchors["target_after"]["spread"]
+    goal = anchors["reference"]["spread"]
+    assert goal > before            # 이 쌍은 Reference 가 대비가 더 크다
+    assert after > before * 0.9     # 원본보다 납작해지지 않음

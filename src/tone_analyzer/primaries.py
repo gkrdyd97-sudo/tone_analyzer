@@ -62,6 +62,9 @@ SAFE_RANGES = {
     "contrast": (0.85, 1.2),
 }
 
+# Contrast 안전 범위의 기준점(= 원래 미드톤 대비를 유지하는 값)이 가질 수 있는 범위
+BASELINE_CONTRAST_RANGE = (0.75, 1.4)
+
 # 넓은 탐색 범위
 WIDE_RANGES = {
     "gamma": (0.3, 3.0),
@@ -307,9 +310,26 @@ def estimate_primaries(
         spread_for, *np.log(WIDE_RANGES["contrast"]), goal=reference_spread
     )))
 
-    contrast, contrast_limited = (
-        limit_with_distrust(raw_contrast, *SAFE_RANGES["contrast"]) if safe_limits else (raw_contrast, False)
-    )
+    # 믿을 수 있는 구간: 1(변화 없음) ~ baseline('원래 미드톤 대비(25~75% 폭)를 유지하는' 값).
+    # Gain 이 화이트를 눌러 전체가 납작해지면 baseline 이 1 보다 커진다. 거기까지는 되살려야
+    # 원본보다 밋밋해지지 않는다. 안전 범위(0.85~1.2)는 이 구간 바깥으로 더 가는 부분에만 건다.
+    target_spread = float(np.subtract(*np.percentile(target_luma, [75.0, 25.0])))
+    baseline_contrast = float(np.clip(
+        np.exp(_bisect(spread_for, *np.log(WIDE_RANGES["contrast"]), goal=target_spread)),
+        *BASELINE_CONTRAST_RANGE,
+    ))
+
+    if safe_limits:
+        trusted_low = min(1.0, baseline_contrast)
+        trusted_high = max(1.0, baseline_contrast)
+        anchor = trusted_high if raw_contrast > trusted_high else trusted_low
+        if trusted_low <= raw_contrast <= trusted_high:
+            contrast, contrast_limited = raw_contrast, False
+        else:
+            ratio, contrast_limited = limit_with_distrust(raw_contrast / anchor, *SAFE_RANGES["contrast"])
+            contrast = anchor * ratio
+    else:
+        contrast, contrast_limited = raw_contrast, False
 
     limited = [name for name, flag in (("gamma", gamma_limited), ("contrast", contrast_limited)) if flag]
 
@@ -345,6 +365,7 @@ def estimate_primaries(
         },
         "lift_gain_history": history,
         "raw_primaries": {"gamma": raw_gamma, "contrast": raw_contrast},
+        "baseline_contrast": baseline_contrast,
         "safe_limits": bool(safe_limits),
         "limited": limited,
         "strength": strength,
