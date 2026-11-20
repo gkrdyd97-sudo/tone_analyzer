@@ -62,6 +62,11 @@ SAFE_RANGES = {
     "contrast": (0.85, 1.2),
 }
 
+# Reference 미드톤(루마 중앙값)이 이보다 어두우면 '로우키' 장면으로 본다.
+# 로우키 영화의 화이트 포인트가 낮은 건 화면에 밝은 게 적어서지, 하이라이트를 눌러서가 아니다.
+# → 화이트를 끌어내리지 않는다 (밝은 조명·창은 살리고 미드톤만 깊게).
+LOW_KEY_MID = 0.3
+
 # Contrast 안전 범위의 기준점(= 원래 미드톤 대비를 유지하는 값)이 가질 수 있는 범위
 BASELINE_CONTRAST_RANGE = (0.75, 1.4)
 
@@ -238,9 +243,13 @@ def estimate_primaries(
     random_seed=42,
     safe_limits=True,
     strength=1.0,
+    tone_follow=0.0,
 ):
     """
     Target -> Reference 의 ① 프라이머리를 컬러리스트 순서대로 하나씩 구한다.
+
+    tone_follow : 0~1 '밝기 따라가기'. 0 = 안전 범위로 줄인 Gamma (기본),
+                  1 = 안전 범위 없이 Reference 미드톤까지 (로그 공간에서 섞음)
 
     safe_limits : True 면 Gamma / Contrast 가 안전 범위를 벗어날 때 원래 값 쪽으로 줄인다
                   (limit_with_distrust). 줄인 항목은 diagnostics["limited"].
@@ -271,9 +280,13 @@ def estimate_primaries(
 
     target_black, target_white = np.percentile(target_luma, [BLACK_PERCENTILE, WHITE_PERCENTILE])
 
+    # 로우키 Reference 면 화이트를 내리지 않는다 (LOW_KEY_MID 설명 참고)
+    low_key = bool(reference_mid < LOW_KEY_MID)
+    white_goal = float(max(reference_white, target_white)) if low_key else float(reference_white)
+
     # 1~3. Lift → Gain → 보간
     lift, gain, history = _lift_gain_interleaved(
-        target_black, target_white, reference_black, reference_white
+        target_black, target_white, reference_black, white_goal
     )
 
     def primaries_with(gamma_value, contrast_value, lift_value=lift, gain_value=gain):
@@ -300,6 +313,11 @@ def estimate_primaries(
     gamma, gamma_limited = (
         limit_with_distrust(raw_gamma, *SAFE_RANGES["gamma"]) if safe_limits else (raw_gamma, False)
     )
+
+    # 밝기 따라가기: 안전 범위 값 → 원래 계산값 쪽으로 (사용자가 원할 때만)
+    follow = float(np.clip(tone_follow, 0.0, 1.0))
+    if follow > 0.0:
+        gamma = float(np.exp(np.log(gamma) + follow * (np.log(raw_gamma) - np.log(gamma))))
 
     # 5. Contrast / Pivot: 25~75% 폭 → Reference 폭 (S 커브, 피벗 = Reference 중앙값)
     def spread_for(log_contrast):
@@ -366,6 +384,9 @@ def estimate_primaries(
         "lift_gain_history": history,
         "raw_primaries": {"gamma": raw_gamma, "contrast": raw_contrast},
         "baseline_contrast": baseline_contrast,
+        "low_key": low_key,
+        "white_goal": white_goal,
+        "tone_follow": follow,
         "safe_limits": bool(safe_limits),
         "limited": limited,
         "strength": strength,

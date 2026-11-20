@@ -172,6 +172,16 @@ tone_safe_limits = st.sidebar.checkbox(
 )
 
 
+tone_follow = st.sidebar.slider(
+    "밝기 따라가기 (Gamma)",
+    0.0, 1.0, 0.0, 0.05,
+    help=(
+        "0 = 안전 범위로 줄인 Gamma, 1 = Reference 미드톤까지 그대로. "
+        "어두운(로우키) 영화 장면을 밝은 장소에서 따라 할 때 올리세요."
+    ),
+)
+
+
 tone_strength = st.sidebar.slider(
     "① 프라이머리 강도",
     min_value=0.0,
@@ -519,6 +529,7 @@ if run_button:
                     auto_crop=auto_crop,
                     tone_strength=tone_strength,
                     tone_safe_limits=tone_safe_limits,
+                    tone_follow=tone_follow,
                     match_mode=match_mode,
                     saturation_strength=saturation_strength,
                     skin_lightness_strength=skin_lightness_strength,

@@ -285,6 +285,7 @@ def run_tone_matching_pipeline(
     auto_crop=True,
     tone_strength=1.0,
     tone_safe_limits=True,
+    tone_follow=0.0,
     match_mode="look",
     saturation_strength=1.0,
     skin_lightness_strength=0.5,
@@ -413,6 +414,7 @@ def run_tone_matching_pipeline(
             reference_rgb=reference_rgb,
             safe_limits=tone_safe_limits,
             strength=tone_strength,
+            tone_follow=tone_follow,
         )
 
         primaries = primaries_result["primaries"]

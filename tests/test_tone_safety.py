@@ -210,3 +210,24 @@ def test_gain_compression_does_not_flatten_midtones():
     goal = anchors["reference"]["spread"]
     assert goal > before            # 이 쌍은 Reference 가 대비가 더 크다
     assert after > before * 0.9     # 원본보다 납작해지지 않음
+
+
+def test_low_key_reference_keeps_highlights():
+    """어두운(로우키) Reference 는 화이트를 끌어내리지 않는다 → 밝은 벽·조명이 회색이 되지 않음"""
+    target = _scene(240, 400, seed=3)
+    reference = (_scene(240, 400, seed=4).astype(np.float64) * 0.45).astype(np.uint8)   # 어둡고 화이트 낮음
+    d = estimate_primaries(target, reference)["diagnostics"]
+    assert d["low_key"]
+    assert d["anchors"]["target_after"]["white"] >= d["anchors"]["target_before"]["white"] - 0.02
+
+
+def test_tone_follow_reaches_raw_gamma():
+    """밝기 따라가기 1 = 안전 범위 없이 Reference 미드톤까지 / 0 = 기본"""
+    target = _scene(240, 400, seed=5)
+    reference = (_scene(240, 400, seed=6).astype(np.float64) * 0.5).astype(np.uint8)
+    safe = estimate_primaries(target, reference)
+    full = estimate_primaries(target, reference, tone_follow=1.0)
+    raw = safe["diagnostics"]["raw_primaries"]["gamma"]
+    assert full["primaries"]["gamma"] == pytest.approx(raw, rel=1e-6)
+    half = estimate_primaries(target, reference, tone_follow=0.5)["primaries"]["gamma"]
+    assert min(safe["primaries"]["gamma"], raw) <= half <= max(safe["primaries"]["gamma"], raw)
