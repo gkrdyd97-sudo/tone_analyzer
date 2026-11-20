@@ -15,6 +15,8 @@ from .analysis import (
 from .color_matching import (
     evaluate_rgb_model,
     prepare_pixel_pairs,
+    fit_reinhard_tonal,
+    apply_reinhard_tonal,
     train_rgb_model,
 )
 
@@ -271,6 +273,7 @@ def run_tone_matching_pipeline(
     max_sample_count=100_000,
     n_neighbors=64,
     color_method="reinhard",
+    color_fit="grid",
     transfer_strength=0.8,
     preserve_luminance=True,
     tonal_regions=True,
@@ -530,29 +533,59 @@ def run_tone_matching_pipeline(
     reference_samples = pair_data["reference_samples"]
 
 
-    # 5. 색 모델 평가 / 학습
+    # 5~6. 색 LUT 생성
+    #   color_fit="grid"       : 전이 함수를 LUT 격자점에 직접 적용 (기본. 회귀 오차 없음, 결정적)
+    #   color_fit="regression" : 예전 방식. 샘플 쌍으로 회귀 모델을 학습해 LUT 를 뽑는다.
 
-    evaluation_result = evaluate_rgb_model(
-        target_samples=target_samples,
-        reference_samples=reference_samples,
-        n_neighbors=n_neighbors,
-        test_size=0.2,
-        random_seed=42,
+    use_grid = (
+        color_fit == "grid" and color_method == "reinhard" and tonal_regions
     )
 
-    rgb_model = train_rgb_model(
-        target_samples=target_samples,
-        reference_samples=reference_samples,
-        n_neighbors=n_neighbors,
-    )
+    if use_grid:
+        reinhard_model = fit_reinhard_tonal(
+            target_samples=target_samples,
+            reference_samples=pair_data["reference_pool"],
+            preserve_luminance=preserve_luminance,
+        )
 
+        class _GridTransfer:
+            def predict(self, points):
+                return apply_reinhard_tonal(points, reinhard_model)
 
-    # 6. LUT 생성
+        lut_input, color_lut_raw = build_lut_from_model(
+            model=_GridTransfer(),
+            lut_size=lut_size,
+        )
 
-    lut_input, color_lut_raw = build_lut_from_model(
-        model=rgb_model,
-        lut_size=lut_size,
-    )
+        # 평가: 정확한 전이 vs LUT 보간 결과 (격자 보간 오차)
+        exact = apply_reinhard_tonal(target_samples, reinhard_model)
+        via_lut = apply_3d_lut_to_pixels(target_samples, color_lut_raw, lut_size)
+        error = float(np.mean(np.abs(exact - via_lut)))
+        evaluation_result = {
+            "mean_absolute_error": error,
+            "mean_absolute_error_8bit": error * 255.0,
+        }
+    else:
+        reinhard_model = None
+
+        evaluation_result = evaluate_rgb_model(
+            target_samples=target_samples,
+            reference_samples=reference_samples,
+            n_neighbors=n_neighbors,
+            test_size=0.2,
+            random_seed=42,
+        )
+
+        rgb_model = train_rgb_model(
+            target_samples=target_samples,
+            reference_samples=reference_samples,
+            n_neighbors=n_neighbors,
+        )
+
+        lut_input, color_lut_raw = build_lut_from_model(
+            model=rgb_model,
+            lut_size=lut_size,
+        )
 
     primaries_nodes = np.asarray(
         primaries_stage(lut_input), dtype=np.float32
@@ -704,6 +737,8 @@ def run_tone_matching_pipeline(
         },
         "analysis_json_path": str(analysis_json_path.resolve()),
         "lut_size": int(lut_size),
+        "color_fit": "grid" if use_grid else "regression",
+        "reinhard_model": reinhard_model,
         "sample_count": int(len(target_samples)),
         "mean_absolute_error": float(
             evaluation_result["mean_absolute_error"]

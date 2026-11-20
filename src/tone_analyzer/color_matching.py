@@ -316,6 +316,98 @@ def transfer_color_reinhard_tonal(
     return _lab_to_rgb(result_lab).astype(np.float32)
 
 
+# ─────────────────────────────────────────
+# 격자 직접 평가 (ROADMAP D8)
+#   샘플 → 전이 → 회귀 학습 → LUT 대신, 전이 함수 자체를 LUT 격자점에 바로 적용한다.
+#   회귀 오차가 없고 결과가 결정적이라 Swift 포팅·대조가 쉽다.
+# ─────────────────────────────────────────
+
+TONAL_PERCENTILES = (20.0, 80.0)
+
+
+def _tonal_weights_with(lightness, thresholds):
+    """compute_tonal_weights 와 같은 식이지만 경계값(섀도우/하이라이트 퍼센타일)을 밖에서 받는다."""
+
+    shadow_threshold, highlight_threshold = thresholds
+    width = max((highlight_threshold - shadow_threshold) * 0.35, 2.0)
+
+    shadow = 1.0 - _smoothstep(shadow_threshold - width, shadow_threshold + width, lightness)
+    highlight = _smoothstep(highlight_threshold - width, highlight_threshold + width, lightness)
+    midtone = np.clip(1.0 - shadow - highlight, 0.0, 1.0)
+
+    weights = np.stack([shadow, midtone, highlight], axis=1)
+    weights /= weights.sum(axis=1, keepdims=True) + 1e-8
+    return weights
+
+
+def fit_reinhard_tonal(
+    target_samples,
+    reference_samples,
+    preserve_luminance=True,
+    min_std_ratio=0.4,
+    max_std_ratio=2.5,
+):
+    """
+    톤 영역별 Reinhard 전이의 파라미터를 구한다. (Lab 은 정확한 수식, skin_tone.srgb_to_lab)
+
+    Returns
+    -------
+    dict
+        target_thresholds : Target L 의 20 / 80 퍼센타일 (적용할 점의 영역 가중치 계산에 사용)
+        channels          : 전이할 Lab 채널 (밝기 유지면 a, b 만)
+        regions           : [채널][영역] = (target_mean, ratio, reference_mean)
+    """
+
+    from .skin_tone import srgb_to_lab
+
+    target_lab = srgb_to_lab(np.asarray(target_samples, dtype=np.float64))
+    reference_lab = srgb_to_lab(np.asarray(reference_samples, dtype=np.float64))
+
+    target_thresholds = tuple(np.percentile(target_lab[:, 0], TONAL_PERCENTILES))
+    reference_thresholds = tuple(np.percentile(reference_lab[:, 0], TONAL_PERCENTILES))
+
+    target_weights = _tonal_weights_with(target_lab[:, 0], target_thresholds)
+    reference_weights = _tonal_weights_with(reference_lab[:, 0], reference_thresholds)
+
+    channels = [1, 2] if preserve_luminance else [0, 1, 2]
+    regions = {}
+
+    for channel in channels:
+        regions[channel] = []
+        for region in range(3):
+            t_mean, t_std = _weighted_mean_std(target_lab[:, channel], target_weights[:, region])
+            r_mean, r_std = _weighted_mean_std(reference_lab[:, channel], reference_weights[:, region])
+            ratio = float(np.clip(r_std / (t_std + 1e-6), min_std_ratio, max_std_ratio))
+            if channel != 0:
+                ratio = ratio ** CHROMA_STD_EXPONENT
+            regions[channel].append((float(t_mean), ratio, float(r_mean)))
+
+    return {
+        "target_thresholds": [float(v) for v in target_thresholds],
+        "reference_thresholds": [float(v) for v in reference_thresholds],
+        "channels": channels,
+        "regions": regions,
+    }
+
+
+def apply_reinhard_tonal(points, model):
+    """fit_reinhard_tonal 결과를 임의의 (N, 3) 0~1 RGB 점(LUT 격자 등)에 적용한다."""
+
+    from .skin_tone import lab_to_srgb, srgb_to_lab
+
+    lab = srgb_to_lab(np.asarray(points, dtype=np.float64))
+    weights = _tonal_weights_with(lab[:, 0], model["target_thresholds"])
+
+    result = lab.copy()
+    for channel in model["channels"]:
+        blended = np.zeros(len(lab))
+        for region, (t_mean, ratio, r_mean) in enumerate(model["regions"][channel]):
+            blended += ((lab[:, channel] - t_mean) * ratio + r_mean) * weights[:, region]
+        result[:, channel] = blended
+
+    return lab_to_srgb(result).astype(np.float32)
+
+
 def compute_skin_weights(rgb_samples):
     """
     피부색일 가능성(0~1)을 Lab 색상각 / 채도 / 밝기로 추정한다.
