@@ -231,3 +231,14 @@ def test_tone_follow_reaches_raw_gamma():
     assert full["primaries"]["gamma"] == pytest.approx(raw, rel=1e-6)
     half = estimate_primaries(target, reference, tone_follow=0.5)["primaries"]["gamma"]
     assert min(safe["primaries"]["gamma"], raw) <= half <= max(safe["primaries"]["gamma"], raw)
+
+
+def test_tone_follow_boosts_highlights_and_keeps_contrast():
+    """밝기 따라가기: Gamma 로 내려온 파형 윗부분만큼 Gain 보강, 대비는 낮추지 않음"""
+    target = _scene(240, 400, seed=7)
+    reference = (_scene(240, 400, seed=8).astype(np.float64) * 0.5).astype(np.uint8)
+    safe = estimate_primaries(target, reference)["primaries"]
+    full = estimate_primaries(target, reference, tone_follow=1.0)["primaries"]
+    assert safe["boost"] == 1.0
+    assert full["boost"] > 1.0
+    assert full["contrast"] >= 1.0 - 1e-9

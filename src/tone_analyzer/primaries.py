@@ -50,6 +50,7 @@ NEUTRAL_PRIMARIES = {
     "pivot": 0.435,
     "black": 0.0,
     "white": 1.0,
+    "boost": 1.0,
 }
 
 # Lift / Gain 은 블랙·화이트 포인트라 내용 차이에 강하다 → 넓은 한계만
@@ -66,6 +67,11 @@ SAFE_RANGES = {
 # 로우키 영화의 화이트 포인트가 낮은 건 화면에 밝은 게 적어서지, 하이라이트를 눌러서가 아니다.
 # → 화이트를 끌어내리지 않는다 (밝은 조명·창은 살리고 미드톤만 깊게).
 LOW_KEY_MID = 0.3
+
+# 밝기 따라가기의 Gain 보강 기준: 파형 맨 윗부분 (작은 반사광 제외)
+TOP_PERCENTILE = 98.0
+# Gain 보강 최대 배율
+MAX_BOOST = 1.5
 
 # Contrast 안전 범위의 기준점(= 원래 미드톤 대비를 유지하는 값)이 가질 수 있는 범위
 BASELINE_CONTRAST_RANGE = (0.75, 1.4)
@@ -110,6 +116,7 @@ def apply_primaries(pixels, primaries):
     black = float(primaries.get("black", 0.0))
     white = float(primaries.get("white", 1.0))
     pivot = float(primaries.get("pivot", 0.435))
+    boost = float(primaries.get("boost", 1.0))
 
     y = (x + lift * (1.0 - x)) * gain
 
@@ -118,6 +125,10 @@ def apply_primaries(pixels, primaries):
 
     inside = (n > 0.0) & (n < 1.0)
     n = np.where(inside, np.clip(n, 1e-6, 1.0) ** (1.0 / gamma), n)
+
+    # 밝기 따라가기의 Gain 보강: Gamma 로 내려온 파형 윗부분을 다시 올린다 (블랙 기준)
+    if abs(boost - 1.0) > 1e-9:
+        n = n * boost
 
     if abs(contrast - 1.0) > 1e-6:
         n = _s_curve(n, contrast, (pivot - black) / span)
@@ -184,7 +195,7 @@ def blend_primaries(primaries, strength):
 
     blended = dict(primaries)
     blended["lift"] = float(primaries["lift"]) * strength
-    for name in ("gamma", "gain", "contrast"):
+    for name in ("gamma", "gain", "contrast", "boost"):
         blended[name] = float(primaries[name]) ** strength
     return blended
 
@@ -289,12 +300,12 @@ def estimate_primaries(
         target_black, target_white, reference_black, white_goal
     )
 
-    def primaries_with(gamma_value, contrast_value, lift_value=lift, gain_value=gain):
+    def primaries_with(gamma_value, contrast_value, lift_value=lift, gain_value=gain, boost_value=1.0):
         black = (target_black + lift_value * (1.0 - target_black)) * gain_value
         white = (target_white + lift_value * (1.0 - target_white)) * gain_value
         return {
             "lift": lift_value, "gain": gain_value,
-            "gamma": gamma_value, "contrast": contrast_value,
+            "gamma": gamma_value, "contrast": contrast_value, "boost": boost_value,
             "pivot": float(reference_mid),
             "black": float(black), "white": float(white),
         }
@@ -314,14 +325,26 @@ def estimate_primaries(
         limit_with_distrust(raw_gamma, *SAFE_RANGES["gamma"]) if safe_limits else (raw_gamma, False)
     )
 
-    # 밝기 따라가기: 안전 범위 값 → 원래 계산값 쪽으로 (사용자가 원할 때만)
+    # 밝기 따라가기 (사용자가 원할 때만). 컬러리스트 방식:
+    #   Gamma 를 더 눌러 미드톤을 무겁게 → 파형 맨 윗부분(상위 2%)이 내려온 만큼 Gain 으로 보강
+    #   → 미드톤은 어둡고 하이라이트는 살아 있어 묵직하면서 대비가 생긴다.
     follow = float(np.clip(tone_follow, 0.0, 1.0))
+    boost = 1.0
     if follow > 0.0:
+        safe_gamma = gamma
         gamma = float(np.exp(np.log(gamma) + follow * (np.log(raw_gamma) - np.log(gamma))))
+
+        def top_for(gamma_value):
+            return float(np.percentile(output_luma(primaries_with(gamma_value, 1.0)), TOP_PERCENTILE))
+
+        black_now = primaries_with(gamma, 1.0)["black"]
+        top_safe, top_now = top_for(safe_gamma), top_for(gamma)
+        if top_now - black_now > 1e-3:
+            boost = float(np.clip((top_safe - black_now) / (top_now - black_now), 1.0, MAX_BOOST))
 
     # 5. Contrast / Pivot: 25~75% 폭 → Reference 폭 (S 커브, 피벗 = Reference 중앙값)
     def spread_for(log_contrast):
-        values = output_luma(primaries_with(gamma, np.exp(log_contrast)))
+        values = output_luma(primaries_with(gamma, np.exp(log_contrast), boost_value=boost))
         return float(np.subtract(*np.percentile(values, [75.0, 25.0])))
 
     raw_contrast = float(np.exp(_bisect(
@@ -349,13 +372,19 @@ def estimate_primaries(
     else:
         contrast, contrast_limited = raw_contrast, False
 
+    # 밝기 따라가기 중에는 대비를 낮추지 않는다. 어두운 영화의 좁은 미드톤 폭은 '밋밋하게 하라'가 아니라
+    # 화면 대부분이 어둡다는 뜻이라, 따라가면 Gamma 로 만든 무게감이 다시 납작해진다.
+    if follow > 0.0 and contrast < 1.0:
+        contrast = float(np.exp(np.log(contrast) * (1.0 - follow)))
+
     limited = [name for name, flag in (("gamma", gamma_limited), ("contrast", contrast_limited)) if flag]
 
     # ① 강도: 섞은 값으로 블랙·화이트를 다시 계산
     strength = float(np.clip(strength, 0.0, 1.0))
-    blended = blend_primaries(primaries_with(gamma, contrast), strength)
+    blended = blend_primaries(primaries_with(gamma, contrast, boost_value=boost), strength)
     primaries = primaries_with(
-        blended["gamma"], blended["contrast"], lift_value=blended["lift"], gain_value=blended["gain"]
+        blended["gamma"], blended["contrast"], lift_value=blended["lift"], gain_value=blended["gain"],
+        boost_value=blended["boost"],
     )
 
     if strength < 1.0:
@@ -387,6 +416,7 @@ def estimate_primaries(
         "low_key": low_key,
         "white_goal": white_goal,
         "tone_follow": follow,
+        "boost": boost,
         "safe_limits": bool(safe_limits),
         "limited": limited,
         "strength": strength,
