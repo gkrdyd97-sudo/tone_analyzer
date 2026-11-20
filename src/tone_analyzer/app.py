@@ -41,6 +41,7 @@ from tone_analyzer.lut import (
 
 from tone_analyzer.pipeline import (
     build_final_luts,
+    resolve_skin_processing,
     run_tone_matching_pipeline,
 )
 
@@ -56,6 +57,7 @@ from tone_analyzer.white_balance import (
 from tone_analyzer.skin_tone import (
     SKIN_LINE_HUE,
     is_reliable_skin,
+    skin_leakage,
     skin_mask_from_cluster,
     skin_cluster_from_pixels,
     render_vectorscope,
@@ -273,6 +275,17 @@ skin_saturation = st.sidebar.slider(
 )
 
 
+skin_without_face = st.sidebar.checkbox(
+    "얼굴이 없어도 색 기준으로 피부 처리",
+    value=False,
+    help=(
+        "기본: 얼굴을 찾지 못하면 ④ 피부 보호와 ⑤ 교정을 건너뜁니다 "
+        "(사람이 없는 장면의 나무·모래·노을을 피부로 처리하지 않도록). "
+        "뒷모습이나 아주 작은 인물처럼 사람은 있는데 얼굴이 안 잡힐 때 켜세요."
+    ),
+)
+
+
 # 이미지 업로드
 
 reference_file = st.file_uploader(
@@ -425,6 +438,7 @@ if run_button:
                     skin_target_mode=skin_target_mode,
                     skin_hue_strength=skin_hue_strength,
                     skin_saturation=skin_saturation,
+                    skin_without_face=skin_without_face,
                     tone_method=tone_method,
                     balance_strength=balance_strength,
                     white_balance_mode=white_balance_mode,
@@ -503,6 +517,12 @@ if session_result is not None:
                 "(얼굴이 없거나 너무 어둡거나 무채색) 스킨톤 라인을 목표로 사용합니다."
             )
 
+    skin_enabled, active_skin_samples = resolve_skin_processing(
+        face_samples=pipeline_result.get("target_skin_samples"),
+        color_samples=pipeline_result.get("target_skin_color_samples"),
+        skin_without_face=skin_without_face,
+    )
+
     current_luts = build_final_luts(
         lut_input=pipeline_result["lut_input"],
         tone_stage_nodes=pipeline_result["tone_stage_nodes"],
@@ -515,7 +535,8 @@ if session_result is not None:
         skin_target_hue=skin_target_hue,
         skin_hue_strength=skin_hue_strength,
         skin_saturation=skin_saturation,
-        skin_samples=pipeline_result.get("target_skin_samples"),
+        skin_samples=active_skin_samples,
+        skin_enabled=skin_enabled,
     )
 
     current_lut = current_luts["color"]
@@ -565,9 +586,7 @@ if session_result is not None:
         (
             f"얼굴 {target_skin_info.get('face_count', 0)}개"
             if target_skin_info.get("source") == "face"
-            else "색 기반 추정"
-            if target_skin_info.get("source") == "color"
-            else "없음"
+            else "얼굴 없음"
         ),
     )
 
@@ -617,20 +636,38 @@ if session_result is not None:
     skin_before = {"hue": current_luts.get("skin_hue_before")}
     skin_after = {"hue": current_luts.get("skin_hue_after")}
 
-    if target_skin.get("source") == "face":
+    using_face = target_skin.get("source") == "face"
+
+    if using_face:
         st.caption(
             f"얼굴 {target_skin.get('face_count', 0)}개에서 피부를 샘플링해 "
             "④ 피부 보호와 ⑤ 교정 범위를 정했습니다."
         )
-    elif target_skin.get("source") == "color":
+    elif skin_enabled:
         st.warning(
-            "얼굴을 찾지 못해 색만으로 피부를 추정했습니다. "
+            "얼굴을 찾지 못해 색만으로 피부를 추정했습니다 "
+            "('얼굴이 없어도 색 기준으로 피부 처리' 켜짐). "
             "피부와 비슷한 색의 배경도 피부로 처리될 수 있습니다."
         )
     else:
-        st.info("피부를 찾지 못해 ④ 피부 보호와 ⑤ 교정을 넓은 기본 범위로 처리합니다.")
+        st.info(
+            "얼굴을 찾지 못해 ④ 피부 보호와 ⑤ 스킨톤 교정을 건너뛰었습니다. "
+            "사람이 있는데 얼굴이 안 잡히는 장면(뒷모습, 작은 인물)이면 "
+            "사이드바의 '얼굴이 없어도 색 기준으로 피부 처리'를 켜세요."
+        )
 
-    leakage = target_skin.get("leakage")
+    if skin_enabled:
+        leakage = (
+            target_skin.get("leakage")
+            if using_face
+            else skin_leakage(
+                session_result["preview_rgb"],
+                skin_cluster_from_pixels(active_skin_samples),
+                [],
+            )
+        )
+    else:
+        leakage = None
 
     if leakage is not None and leakage > 0.05:
         st.warning(
@@ -718,10 +755,18 @@ if session_result is not None:
 
         with mask_cols[1]:
             st.write("피부 마스크 (④ 보호 / ⑤ 교정 범위)")
-            st.image(
-                session_result["skin_mask_preview"],
-                width="stretch",
-            )
+
+            if not skin_enabled:
+                mask = np.zeros(session_result["preview_rgb"].shape[:2], dtype=np.uint8)
+            elif using_face:
+                mask = session_result["skin_mask_preview"]
+            else:
+                mask = skin_mask_from_cluster(
+                    session_result["preview_rgb"],
+                    skin_cluster_from_pixels(active_skin_samples),
+                )
+
+            st.image(mask, width="stretch")
 
         st.caption(
             "흰색일수록 피부로 처리됩니다. 얼굴 밖에 흰 영역이 많으면 "

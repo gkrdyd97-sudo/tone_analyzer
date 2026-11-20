@@ -80,9 +80,13 @@ def build_final_luts(
     skin_saturation=1.0,
     skin_chroma=None,
     skin_samples=None,
+    skin_enabled=True,
 ):
     """
     현재 강도 / 피부 보호 설정으로 내보낼 LUT 를 만든다.
+
+    skin_enabled : False 면 ④ 피부 보호와 ⑤ 교정을 건너뛴다.
+        (사람이 없는 장면에서 피부와 비슷한 색의 사물을 피부로 처리하지 않도록)
 
     skin_samples : ①②③ 까지 적용한 이미지의 얼굴 피부 픽셀 (N, 3) 0~1.
         - ④ 피부 보호는 이 색 범위만 보호하고
@@ -101,7 +105,16 @@ def build_final_luts(
         skin_hue_before / skin_hue_after : ⑤ 전후 피부 색상각 (샘플 기준)
     """
 
-    has_samples = skin_samples is not None and len(skin_samples) >= 50
+    has_samples = (
+        skin_enabled
+        and skin_samples is not None
+        and len(skin_samples) >= 50
+    )
+
+    if not skin_enabled:
+        skin_protection = 0.0
+        skin_hue_strength = 0.0
+        skin_saturation = 1.0
 
     pre_grade_cluster = (
         skin_cluster_from_pixels(skin_samples) if has_samples else None
@@ -184,6 +197,33 @@ def build_final_luts(
     }
 
 
+def resolve_skin_processing(
+    face_samples,
+    color_samples,
+    skin_without_face=False,
+):
+    """
+    ④⑤ 피부 처리를 할지, 어떤 피부 샘플을 쓸지 정한다.
+
+    - 얼굴 샘플이 있으면: 처리 O, 얼굴 샘플 사용
+    - 얼굴이 없고 skin_without_face=False (기본): 처리 X
+      (사람이 없는 장면의 나무·모래·노을을 피부로 처리하지 않도록)
+    - 얼굴이 없고 skin_without_face=True: 색 기준으로 추정한 피부로 처리
+
+    Returns
+    -------
+    (skin_enabled, samples)
+    """
+
+    if face_samples is not None and len(face_samples) >= 50:
+        return True, face_samples
+
+    if skin_without_face and color_samples is not None and len(color_samples) >= 50:
+        return True, color_samples
+
+    return False, None
+
+
 def run_tone_matching_pipeline(
     reference_path,
     target_path,
@@ -202,6 +242,7 @@ def run_tone_matching_pipeline(
     skin_target_mode="line",
     skin_hue_strength=0.5,
     skin_saturation=1.0,
+    skin_without_face=False,
 ):
     """
     전체 톤 매칭 파이프라인.
@@ -215,6 +256,10 @@ def run_tone_matching_pipeline(
     ④ 컬러 그레이딩 (Reference 색감, 3D LUT) + 피부 보호 / 강도
     ⑤ 스킨톤 교정 (피부 색상을 스킨톤 라인 또는 Reference 피부 쪽으로, 채도 조절)
        skin_target_mode = "line" | "reference"
+
+    얼굴이 없으면 ④ 피부 보호와 ⑤ 교정은 기본적으로 건너뛴다.
+    skin_without_face=True 면 색 기준으로 추정한 피부로 처리한다.
+    (뒷모습, 아주 작은 인물처럼 사람은 있는데 얼굴이 안 잡히는 경우)
 
     내보내는 .cube
     -------------
@@ -406,18 +451,35 @@ def run_tone_matching_pipeline(
         tone_stage(lut_input), dtype=np.float32
     )
 
-    # ④⑤ 피부: ①②③ 이후 이미지의 얼굴에서 피부 샘플링 (없으면 색 기반)
-    target_skin, target_skin_samples = measure_skin_samples(
+    # ④⑤ 피부: ①②③ 이후 이미지의 얼굴에서 피부 샘플링
+    #    얼굴이 없으면 색 기반 후보만 따로 보관해 두고 기본적으로는 쓰지 않는다.
+    target_skin, measured_samples = measure_skin_samples(
         target_tone_matched_rgb,
         faces=target_faces,
     )
 
+    if target_skin["source"] == "face":
+        target_skin_samples = measured_samples
+        target_skin_color_samples = None
+    else:
+        target_skin_samples = None
+        target_skin_color_samples = measured_samples
+
+    skin_enabled, active_skin_samples = resolve_skin_processing(
+        face_samples=target_skin_samples,
+        color_samples=target_skin_color_samples,
+        skin_without_face=skin_without_face,
+    )
+
     reference_skin, _ = measure_skin_samples(reference_rgb)
 
-    target_skin["leakage"] = skin_leakage(
-        target_tone_matched_rgb,
-        skin_cluster_from_pixels(target_skin_samples),
-        target_faces if target_skin["source"] == "face" else [],
+    target_skin["leakage"] = (
+        skin_leakage(
+            target_tone_matched_rgb,
+            skin_cluster_from_pixels(active_skin_samples),
+            target_faces if target_skin["source"] == "face" else [],
+        )
+        if skin_enabled else None
     )
 
     skin_target_hue, skin_target_used = resolve_target_hue(
@@ -437,7 +499,8 @@ def run_tone_matching_pipeline(
         skin_target_hue=skin_target_hue,
         skin_hue_strength=skin_hue_strength,
         skin_saturation=skin_saturation,
-        skin_samples=target_skin_samples,
+        skin_samples=active_skin_samples,
+        skin_enabled=skin_enabled,
     )
 
 
@@ -533,6 +596,9 @@ def run_tone_matching_pipeline(
         "reference_skin": reference_skin,
         "target_skin": target_skin,
         "target_skin_samples": target_skin_samples,
+        "target_skin_color_samples": target_skin_color_samples,
+        "skin_enabled": skin_enabled,
+        "skin_without_face": skin_without_face,
         "target_faces": target_faces,
         "white_balance_mode": white_balance_mode,
         "skin_line_hue": float(SKIN_LINE_HUE),
