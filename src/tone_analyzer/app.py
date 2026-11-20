@@ -153,26 +153,27 @@ tone_method = st.sidebar.selectbox(
     options=["primaries", "histogram"],
     index=0,
     format_func=lambda value: {
-        "primaries": "① LGG → ② Contrast/Pivot",
+        "primaries": "① Lift → Gain → Gamma → Contrast (파형 기준점)",
         "histogram": "히스토그램 매칭 커브 (이전 방식)",
     }[value],
 )
 
 
 tone_safe_limits = st.sidebar.checkbox(
-    "①② 안전 범위",
+    "①③ 안전 범위",
     value=True,
     disabled=same_scene,
     help=(
-        "Gamma 0.8~1.25, Gain 0.85~1.15, Lift ±0.04, Contrast 0.85~1.2 안에서만 맞춥니다. "
-        "두 이미지의 '내용 차이'(검은 옷이 많은 레퍼런스 등)를 노출 차이로 착각해 계조를 크게 비트는 것을 막습니다. "
+        "블랙·화이트(Lift·Gain)는 그대로 맞추고, 화면 내용에 흔들리는 Gamma 0.8~1.25, Contrast 0.85~1.2, "
+        "채도 0.8~1.25 는 범위를 벗어나면 원래 값 쪽으로 줄입니다 (많이 벗어날수록 더 적게 적용). "
+        "검은 옷이 많은 컷 같은 '내용 차이'를 노출 차이로 착각하는 것을 막습니다. "
         "실제로 노출이 크게 다른 사진을 맞출 때만 끄세요."
     ),
 )
 
 
 tone_strength = st.sidebar.slider(
-    "①② 강도",
+    "① 프라이머리 강도",
     min_value=0.0,
     max_value=1.0,
     value=0.0 if same_scene else 1.0,
@@ -183,7 +184,7 @@ tone_strength = st.sidebar.slider(
 
 
 white_balance_mode = st.sidebar.radio(
-    "③ 화이트밸런스 기준",
+    "② 화이트밸런스 기준",
     options=["neutral", "reference"],
     index=1 if same_scene else 0,
     disabled=same_scene,
@@ -200,7 +201,7 @@ white_balance_mode = st.sidebar.radio(
 
 
 balance_strength = st.sidebar.slider(
-    "③ 화이트밸런스 강도",
+    "② 화이트밸런스 강도",
     min_value=0.0,
     max_value=1.0,
     value=0.7,
@@ -209,6 +210,16 @@ balance_strength = st.sidebar.slider(
         "목표 쪽으로 옮기는 정도. 1 이면 중성색을 완전히 회색으로 맞춥니다. "
         "조명의 의도된 색(텅스텐의 따뜻함 등)을 조금 남기려면 0.6~0.8."
     ),
+)
+
+
+saturation_strength = st.sidebar.slider(
+    "③ 채도 강도",
+    min_value=0.0,
+    max_value=1.0,
+    value=1.0,
+    step=0.05,
+    help="두 이미지에 얼굴이 있으면 피부 채도, 없으면 미드톤 채도를 Reference 에 맞춥니다. 0 이면 채도를 건드리지 않습니다.",
 )
 
 
@@ -311,6 +322,20 @@ skin_hue_strength = st.sidebar.slider(
     value=0.5,
     step=0.05,
     help="피부 색상과 목표 색상의 차이를 이 비율만큼 줄입니다. 0이면 교정하지 않습니다.",
+)
+
+
+skin_lightness_strength = st.sidebar.slider(
+    "피부 밝기 맞춤",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.5,
+    step=0.05,
+    help=(
+        "퀄리파이어로 잡은 피부 밝기를 Reference 얼굴 피부 밝기 쪽으로 옮깁니다 (최대 ±12%). "
+        "큰 노출 차이는 ① 프라이머리의 몫이고, 퀄리파이어로 밝기를 크게 바꾸면 얼룩이 생기기 때문입니다. "
+        "두 이미지 모두 얼굴이 있고 교정 목표가 'Reference 속 피부 색'일 때만 적용됩니다."
+    ),
 )
 
 
@@ -495,6 +520,8 @@ if run_button:
                     tone_strength=tone_strength,
                     tone_safe_limits=tone_safe_limits,
                     match_mode=match_mode,
+                    saturation_strength=saturation_strength,
+                    skin_lightness_strength=skin_lightness_strength,
                 )
             )
 
@@ -576,6 +603,16 @@ if session_result is not None:
         skin_without_face=skin_without_face,
     )
 
+    skin_lightness_target = (
+        reference_skin.get("lightness")
+        if (
+            skin_target_label == "Reference 피부"
+            and skin_enabled
+            and (pipeline_result.get("target_skin") or {}).get("source") == "face"
+        )
+        else None
+    )
+
     current_luts = build_final_luts(
         lut_input=pipeline_result["lut_input"],
         tone_stage_nodes=pipeline_result["tone_stage_nodes"],
@@ -590,6 +627,9 @@ if session_result is not None:
         skin_saturation=skin_saturation,
         skin_samples=active_skin_samples,
         skin_enabled=skin_enabled,
+        saturation_nodes=pipeline_result.get("saturation_nodes"),
+        skin_target_lightness=skin_lightness_target,
+        skin_lightness_strength=skin_lightness_strength,
     )
 
     current_lut = current_luts["color"]
@@ -681,17 +721,17 @@ if session_result is not None:
 
 
     tone_label = (
-        "①② LGG + Contrast"
+        "① 프라이머리 (Lift→Gain→Gamma→Contrast)"
         if pipeline_result["tone_method"] == "primaries"
-        else "①② 히스토그램 커브"
+        else "① 히스토그램 커브"
     )
 
     stage_images = [
         ("원본 Target", session_result["original_preview_rgb"]),
         (tone_label, session_result["primaries_preview_rgb"]),
-        ("③ + 화이트밸런스", session_result["preview_rgb"]),
-        ("④ + 컬러 그레이딩", preview_graded),
-        ("⑤ + 스킨톤 교정 (최종)", preview_after),
+        (f"② 화이트밸런스 + ③ 채도 ×{pipeline_result.get('saturation', 1.0):.2f}", session_result["preview_rgb"]),
+        ("④ + 색작업", preview_graded),
+        ("⑤ + 피부톤 (최종)", preview_after),
     ]
 
     for row_start in (0, 3):
@@ -884,24 +924,41 @@ if session_result is not None:
         diagnostics = pipeline_result["primaries_diagnostics"]
 
         with value_cols[0]:
-            st.write("①② Lift / Gamma / Gain → Contrast / Pivot")
+            st.write("① 프라이머리 (Lift → Gain → 보간 → Gamma → Contrast / Pivot)")
             st.dataframe(
                 format_table(format_primaries_table(primaries)),
                 hide_index=True,
                 width="stretch",
             )
 
+            anchors = diagnostics.get("anchors")
+            if anchors:
+                def ire(value):
+                    return f"{value * 100:.1f}%"
+                st.dataframe(
+                    {
+                        "파형 기준점": ["블랙 (하위 0.5%)", "미드톤 (중앙값)", "화이트 (상위 0.5%)", "계조 (25~75% 폭)"],
+                        "Reference": [ire(anchors["reference"][k]) for k in ("black", "mid", "white", "spread")],
+                        "Target 전": [ire(anchors["target_before"][k]) for k in ("black", "mid", "white", "spread")],
+                        "Target 후": [ire(anchors["target_after"][k]) for k in ("black", "mid", "white", "spread")],
+                    },
+                    hide_index=True,
+                    width="stretch",
+                )
+                steps = len(diagnostics.get("lift_gain_history") or [])
+                st.caption(f"Lift ↔ Gain 보간 {steps}회로 블랙·화이트를 맞춘 뒤 Gamma(중앙값), Contrast(계조) 순서로 맞췄습니다.")
+
             if diagnostics.get("limited") and pipeline_result.get("tone_strength", 1.0) > 0:
                 raw = diagnostics.get("raw_primaries") or {}
                 st.warning(
-                    "①② 안전 범위로 제한한 값: "
+                    "안전 범위를 벗어나 줄인 값: "
                     + ", ".join(
-                        f"{name} ({raw.get(name, float('nan')):.2f} → 제한)"
+                        f"{name} (계산 {raw.get(name, float('nan')):.2f} → 적용 {primaries.get(name, float('nan')):.2f})"
                         for name in diagnostics["limited"]
                     )
                     + ". 두 이미지의 밝기 분포 차이가 커서, 화면 내용 차이(검은 옷·그림자 비율 등)를 "
                     "노출 차이로 잘못 읽었을 가능성이 높습니다. 같은 장면의 컷이면 '같은 장면의 컷 맞추기'를, "
-                    "실제로 노출이 크게 다르면 '①② 안전 범위'를 끄세요."
+                    "실제로 노출이 크게 다르면 '①③ 안전 범위'를 끄세요."
                 )
             elif diagnostics.get("parameters_at_bounds") and not diagnostics.get("safe_limits"):
                 st.warning(
@@ -912,7 +969,16 @@ if session_result is not None:
                 )
 
     with value_cols[1]:
-        st.write("③ 화이트밸런스")
+        saturation_diag = pipeline_result.get("saturation_diagnostics") or {}
+        st.write("③ 채도")
+        st.caption(
+            f"채도 ×{pipeline_result.get('saturation', 1.0):.2f} "
+            f"(기준: {'피부 채도' if saturation_diag.get('source') == 'skin' else '미드톤 채도'}, "
+            f"계산 ×{saturation_diag.get('raw_saturation', 1.0):.2f}"
+            + (" → 안전 범위로 줄임" if saturation_diag.get("limited") else "")
+            + ")"
+        )
+        st.write("② 화이트밸런스")
         st.dataframe(
             format_table(
                 format_white_balance_table(pipeline_result["white_balance"])
@@ -936,7 +1002,7 @@ if session_result is not None:
         chart_cols = st.columns(2)
 
         with chart_cols[0]:
-            st.write("①② 전달 곡선 (입력 → 출력)")
+            st.write("① 전달 곡선 (입력 → 출력)")
             st.line_chart(
                 {
                     "적용 후": curve_output,
@@ -967,7 +1033,7 @@ if session_result is not None:
 
     st.caption(
         "원본 소스에는 '전체' LUT 하나만 걸면 앱 결과와 같습니다. "
-        "DaVinci 에서 노드를 나눌 때는 노드 1 → 2 → 3 → 4 순서로 거세요 "
+        "DaVinci 에서 노드를 나눌 때는 노드 1 → 2 → 3 → 4 → 5 순서로 거세요 "
         "(차례로 건 결과도 앱 결과와 같습니다)."
     )
 
@@ -978,6 +1044,7 @@ if session_result is not None:
         skin_target_mode,
         skin_hue_strength,
         skin_saturation,
+        skin_lightness_strength,
     )
 
     strength_tag = (
@@ -986,16 +1053,17 @@ if session_result is not None:
         f"_fix{int(round(skin_hue_strength * 100)):03d}"
     )
 
-    cube_cols = st.columns(5)
+    cube_cols = st.columns(6)
 
     for column, (key, label, suffix) in zip(
         cube_cols,
         [
             ("combined", "LUT: 전체 ①~⑤ (원본 소스용)", ""),
-            ("primaries", "노드 1: ①② LGG + Contrast", "_1_primaries"),
-            ("white_balance", "노드 2: ③ 화이트밸런스", "_2_wb"),
-            ("color", "노드 3: ④ 컬러 그레이딩", "_3_color"),
-            ("skin", "노드 4: ⑤ 스킨톤 교정", "_4_skin"),
+            ("primaries", "노드 1: ① 프라이머리", "_1_primaries"),
+            ("white_balance", "노드 2: ② 화이트밸런스", "_2_wb"),
+            ("saturation", "노드 3: ③ 채도", "_3_sat"),
+            ("color", "노드 4: ④ 색작업", "_4_color"),
+            ("skin", "노드 5: ⑤ 피부톤", "_5_skin"),
         ],
     ):
         with column:

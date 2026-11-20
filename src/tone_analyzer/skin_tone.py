@@ -492,6 +492,9 @@ def measure_skin_samples(rgb_image, faces=None):
         "face_count": int(len(faces)),
         "hue": cluster["hue"] if cluster else None,
         "chroma": cluster["chroma"] if cluster else None,
+        "lightness": (
+            float(np.median(srgb_to_lab(samples)[:, 0])) if samples is not None else None
+        ),
     }
 
     return info, samples
@@ -537,13 +540,17 @@ def correct_skin_pixels(
     hue_strength,
     saturation,
     weights=None,
+    lightness_scale=0.0,
+    lightness_weights=None,
 ):
     """
-    (N, 3) 0~1 RGB 에서 피부색만 색상을 target_hue 쪽으로 당기고 채도를 조절한다.
+    (N, 3) 0~1 RGB 에서 피부색만 색상을 target_hue 쪽으로 당기고 채도·밝기를 조절한다.
 
-    hue_strength : 0~1. 피부의 색상 차이를 이 비율만큼 줄인다.
-    saturation   : 피부 채도 배율. 1 = 그대로.
-    weights      : 피부 가중치를 직접 줄 때 (LUT 격자에서 넓힌 가중치 등)
+    hue_strength    : 0~1. 피부의 색상 차이를 이 비율만큼 줄인다.
+    saturation      : 피부 채도 배율. 1 = 그대로.
+    weights         : 피부 가중치를 직접 줄 때 (LUT 격자에서 넓힌 가중치 등)
+    lightness_scale   : 피부 밝기 배율 - 1 (예: -0.1 = 10% 어둡게). 비율로 바꿔서 피부 결(질감)을 유지한다.
+    lightness_weights : 밝기용 가중치. 색상용보다 넓고 부드러운 키를 써야 얼굴 안에서 얼룩이 생기지 않는다.
     """
 
     lab = srgb_to_lab(pixels)
@@ -565,6 +572,9 @@ def correct_skin_pixels(
     new_chroma = chroma * (1.0 + (float(saturation) - 1.0) * amount)
 
     corrected = lab.copy()
+    if lightness_weights is None:
+        lightness_weights = amount
+    corrected[:, 0] = lab[:, 0] * (1.0 + float(lightness_scale) * np.clip(lightness_weights, 0.0, 1.0))
     corrected[:, 1] = new_chroma * np.cos(new_hue)
     corrected[:, 2] = new_chroma * np.sin(new_hue)
 
@@ -594,6 +604,33 @@ def correction_qualifier(lab, skin_chroma=None):
     return weights
 
 
+# ⑤ 피부 밝기는 작게만 움직인다. 큰 노출 차이는 ① 프라이머리의 몫이고,
+# 퀄리파이어로 밝기를 크게 바꾸면 키 경계에서 얼룩이 생긴다.
+MAX_SKIN_LIGHTNESS_SCALE = 0.12
+
+
+def skin_lightness_weights(lut_input, cluster):
+    """
+    밝기용 피부 키: 색상용 범위보다 넓게 잡고 LUT 격자에서 한 칸 넓힌다(3x3x3).
+    얼굴 안의 모든 피부가 거의 같은 가중치를 받고, 경계는 피부 바깥에서 부드럽게 빠지도록.
+    """
+
+    from .lut import _dilate_3d
+
+    wide = dict(cluster)
+    wide["hue_width"] = min(cluster["hue_width"] * 1.5, 30.0)
+    wide["chroma_low"] = max(cluster["chroma_low"] - 4.0, 0.0)
+    wide["chroma_high"] = cluster["chroma_high"] + 8.0
+    wide["lightness_low"] = max(cluster["lightness_low"] - 12.0, 0.0)
+    wide["lightness_high"] = min(cluster["lightness_high"] + 12.0, 100.0)
+
+    lut_input = np.asarray(lut_input, dtype=np.float64)
+    size = int(round(len(lut_input) ** (1.0 / 3.0)))
+
+    weights = cluster_weights(srgb_to_lab(lut_input), wide).reshape(size, size, size)
+    return _dilate_3d(weights).reshape(-1)
+
+
 def build_skin_correction_lut(
     lut_input,
     target_hue,
@@ -601,9 +638,12 @@ def build_skin_correction_lut(
     saturation,
     skin_chroma=None,
     skin_cluster=None,
+    lightness_scale=0.0,
 ):
     """
-    ⑤ 스킨톤 교정 LUT (노드 4).
+    ⑤ 스킨톤 교정 LUT. 퀄리파이어로 피부만 잡아 색상·채도·밝기를 맞춘다.
+
+    lightness_scale : 피부 밝기 배율 - 1. 밝기는 넓고 부드러운 키(skin_lightness_weights)로 적용한다.
 
     skin_cluster : ④ 이후 실제 얼굴 피부의 색 범위. 있으면 이 범위만 교정한다.
                    (없으면 넓은 색 기준 퀄리파이어 사용)
@@ -615,7 +655,7 @@ def build_skin_correction_lut(
 
     lut_input = np.asarray(lut_input, dtype=np.float64)
 
-    if hue_strength <= 0.0 and abs(saturation - 1.0) < 1e-6:
+    if hue_strength <= 0.0 and abs(saturation - 1.0) < 1e-6 and abs(lightness_scale) < 1e-6:
         return lut_input.astype(np.float32)
 
     # 피부 '보호'와 달리 가중치를 이웃 격자로 넓히지 않는다.
@@ -631,6 +671,11 @@ def build_skin_correction_lut(
         hue_strength=hue_strength,
         saturation=saturation,
         weights=weights,
+        lightness_scale=lightness_scale,
+        lightness_weights=(
+            skin_lightness_weights(lut_input, skin_cluster)
+            if (skin_cluster is not None and abs(lightness_scale) > 1e-6) else None
+        ),
     ).astype(np.float32)
 
 

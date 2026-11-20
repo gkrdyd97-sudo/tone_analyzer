@@ -41,7 +41,10 @@ from .lut import apply_3d_lut_to_pixels
 
 from .letterbox import remove_letterbox
 
+from .saturation import apply_saturation, estimate_saturation
+
 from .skin_tone import (
+    MAX_SKIN_LIGHTNESS_SCALE,
     SKIN_LINE_HUE,
     build_skin_correction_lut,
     detect_faces,
@@ -83,6 +86,9 @@ def build_final_luts(
     skin_chroma=None,
     skin_samples=None,
     skin_enabled=True,
+    saturation_nodes=None,
+    skin_target_lightness=None,
+    skin_lightness_strength=0.0,
 ):
     """
     현재 강도 / 피부 보호 설정으로 내보낼 LUT 를 만든다.
@@ -98,13 +104,18 @@ def build_final_luts(
     Returns
     -------
     dict
-        primaries     : ①② LGG + Contrast/Pivot 만        (노드 1)
-        white_balance : ③ 화이트밸런스만                    (노드 2)
+        primaries     : ① 프라이머리 (Lift→Gain→Gamma→Contrast)  (노드 1)
+        white_balance : ② 화이트밸런스                          (노드 2)
+        saturation    : ③ 채도                                  (노드 3)
         tone          : ①②③ 를 합친 것
-        color         : ④ 컬러 그레이딩 (+ 피부 보호, 강도) (노드 3)
-        skin          : ⑤ 스킨톤 교정                       (노드 4)
+        color         : ④ 색작업 (+ 피부 보호, 강도)            (노드 4)
+        skin          : ⑤ 피부톤 (퀄리파이어: 색상·채도·밝기)    (노드 5)
         combined      : ①~⑤ 전부 (원본 소스에 하나만 거는 LUT)
-        skin_hue_before / skin_hue_after : ⑤ 전후 피부 색상각 (샘플 기준)
+        skin_hue_before / skin_hue_after             : ⑤ 전후 피부 색상각 (샘플 기준)
+        skin_lightness_before / skin_lightness_after : ⑤ 전후 피부 밝기 (Lab L)
+
+    skin_target_lightness : Reference 얼굴 피부 밝기(Lab L). 있으면 ⑤ 에서 피부 밝기도 맞춘다.
+    skin_lightness_strength : 0~1
     """
 
     has_samples = (
@@ -117,6 +128,7 @@ def build_final_luts(
         skin_protection = 0.0
         skin_hue_strength = 0.0
         skin_saturation = 1.0
+        skin_lightness_strength = 0.0
 
     pre_grade_cluster = (
         skin_cluster_from_pixels(skin_samples) if has_samples else None
@@ -145,6 +157,23 @@ def build_final_luts(
         skin_cluster_from_pixels(graded_samples) if has_samples else None
     )
 
+    def samples_lightness(samples):
+        if samples is None:
+            return None
+        return float(np.median(srgb_to_lab(samples)[:, 0]))
+
+    graded_lightness = samples_lightness(graded_samples)
+
+    # 피부 밝기: 비율로, 강도만큼, 최대 ±12% 까지만 (큰 차이는 ① 프라이머리의 몫)
+    lightness_scale = 0.0
+    if skin_target_lightness is not None and graded_lightness:
+        ratio = float(skin_target_lightness) / graded_lightness
+        lightness_scale = float(np.clip(
+            ratio ** float(np.clip(skin_lightness_strength, 0.0, 1.0)) - 1.0,
+            -MAX_SKIN_LIGHTNESS_SCALE,
+            MAX_SKIN_LIGHTNESS_SCALE,
+        ))
+
     skin_lut = build_skin_correction_lut(
         lut_input=lut_input,
         target_hue=skin_target_hue,
@@ -152,6 +181,7 @@ def build_final_luts(
         saturation=skin_saturation,
         skin_chroma=skin_chroma,
         skin_cluster=graded_cluster,
+        lightness_scale=lightness_scale,
     )
 
     def samples_hue(samples):
@@ -189,12 +219,19 @@ def build_final_luts(
             np.asarray(white_balance_nodes, dtype=np.float32)
             if white_balance_nodes is not None else identity
         ),
+        "saturation": (
+            np.asarray(saturation_nodes, dtype=np.float32)
+            if saturation_nodes is not None else identity
+        ),
         "tone": np.asarray(tone_stage_nodes, dtype=np.float32),
         "color": color_lut,
         "skin": skin_lut,
         "combined": combined_lut,
         "skin_hue_before": samples_hue(graded_samples),
         "skin_hue_after": samples_hue(corrected_samples),
+        "skin_lightness_before": graded_lightness,
+        "skin_lightness_after": samples_lightness(corrected_samples),
+        "skin_lightness_scale": lightness_scale,
         "skin_cluster_graded": graded_cluster,
     }
 
@@ -249,6 +286,8 @@ def run_tone_matching_pipeline(
     tone_strength=1.0,
     tone_safe_limits=True,
     match_mode="look",
+    saturation_strength=1.0,
+    skin_lightness_strength=0.5,
 ):
     """
     전체 톤 매칭 파이프라인.
@@ -260,7 +299,18 @@ def run_tone_matching_pipeline(
                           두 컷은 이미 같은 노출·그레이딩이라 밝기 분포 차이는 '내용 차이'다.
                           → ①② 끔(tone_strength=0), ③ 은 Reference 중성색에 맞춤(강도 1).
 
+    작업 순서 (시니어 컬러리스트의 노드 순서)
+    -----------------------------------------
+    ⓪ 레터박스 제거
+    ① 프라이머리: Lift(블랙) → Gain(화이트) → 보간 → Gamma(중앙값) → Contrast/Pivot   (노드 1)
+    ② 화이트밸런스                                                                   (노드 2)
+    ③ 채도 (두 이미지에 얼굴이 있으면 피부 채도 기준)                                   (노드 3)
+    ④ 색작업 (톤 영역별 색, 피부 보호)                                                 (노드 4)
+    ⑤ 피부톤: 퀄리파이어로 피부만 잡아 Reference 피부의 색상·밝기에 맞춤               (노드 5)
+
     auto_crop : 레퍼런스·타깃의 레터박스/필러박스를 잘라내고 분석한다. (결과 이미지도 잘린 크기)
+    saturation_strength : ③ 채도 강도
+    skin_lightness_strength : ⑤ 피부 밝기 맞춤 강도 (Reference 얼굴이 있을 때)
     tone_strength / tone_safe_limits : ①② 강도와 안전 범위 (primaries.estimate_primaries)
 
     순서 (컬러리스트 작업 순서 / DaVinci 노드 구조)
@@ -420,12 +470,38 @@ def run_tone_matching_pipeline(
     def white_balance_stage(pixels):
         return apply_white_balance(pixels, white_balance)
 
-    def tone_stage(pixels):
-        return white_balance_stage(primaries_stage(pixels))
-
-    target_tone_matched_rgb = apply_stage_to_image(
+    target_balanced_rgb = apply_stage_to_image(
         white_balance_stage,
         target_primaries_rgb,
+    )
+
+
+    # ③ 채도: 두 이미지 모두 얼굴이 있으면 피부 채도를 기준으로
+    reference_skin, reference_skin_samples = measure_skin_samples(reference_rgb)
+
+    if reference_skin["source"] != "face":
+        reference_skin_samples = None
+
+    saturation_result = estimate_saturation(
+        target_rgb=target_balanced_rgb,
+        reference_rgb=reference_rgb,
+        target_skin_samples=sample_face_pixels(target_balanced_rgb, target_faces),
+        reference_skin_samples=reference_skin_samples,
+        safe_limits=tone_safe_limits,
+        strength=saturation_strength,
+    )
+
+    saturation = saturation_result["saturation"]
+
+    def saturation_stage(pixels):
+        return apply_saturation(pixels, saturation)
+
+    def tone_stage(pixels):
+        return saturation_stage(white_balance_stage(primaries_stage(pixels)))
+
+    target_tone_matched_rgb = apply_stage_to_image(
+        saturation_stage,
+        target_balanced_rgb,
     )
 
 
@@ -482,6 +558,9 @@ def run_tone_matching_pipeline(
     white_balance_nodes = np.asarray(
         white_balance_stage(lut_input), dtype=np.float32
     )
+    saturation_nodes = np.asarray(
+        saturation_stage(lut_input), dtype=np.float32
+    )
     tone_stage_nodes = np.asarray(
         tone_stage(lut_input), dtype=np.float32
     )
@@ -506,7 +585,6 @@ def run_tone_matching_pipeline(
         skin_without_face=skin_without_face,
     )
 
-    reference_skin, _ = measure_skin_samples(reference_rgb)
 
     target_skin["leakage"] = (
         skin_leakage(
@@ -520,6 +598,17 @@ def run_tone_matching_pipeline(
     skin_target_hue, skin_target_used = resolve_target_hue(
         skin_target_mode,
         reference_skin,
+    )
+
+    # ⑤ 피부 밝기: Reference 얼굴 피부 밝기에 맞춘다.
+    #    (실제 얼굴에서 잰 Target 피부가 있을 때만. 표준 피부 샘플의 밝기는 의미가 없다)
+    reference_skin_lightness_target = (
+        reference_skin.get("lightness")
+        if skin_target_used == "reference" else None
+    )
+    skin_lightness_target = (
+        reference_skin_lightness_target
+        if (skin_enabled and target_skin["source"] == "face") else None
     )
 
     final_luts = build_final_luts(
@@ -536,6 +625,9 @@ def run_tone_matching_pipeline(
         skin_saturation=skin_saturation,
         skin_samples=active_skin_samples,
         skin_enabled=skin_enabled,
+        saturation_nodes=saturation_nodes,
+        skin_target_lightness=skin_lightness_target,
+        skin_lightness_strength=skin_lightness_strength,
     )
 
 
@@ -564,15 +656,17 @@ def run_tone_matching_pipeline(
         "combined": output_directory / f"target_to_reference_{lut_size}.cube",
         "primaries": output_directory / f"target_to_reference_{lut_size}_1_primaries.cube",
         "white_balance": output_directory / f"target_to_reference_{lut_size}_2_wb.cube",
-        "color": output_directory / f"target_to_reference_{lut_size}_3_color.cube",
-        "skin": output_directory / f"target_to_reference_{lut_size}_4_skin.cube",
+        "saturation": output_directory / f"target_to_reference_{lut_size}_3_sat.cube",
+        "color": output_directory / f"target_to_reference_{lut_size}_4_color.cube",
+        "skin": output_directory / f"target_to_reference_{lut_size}_5_skin.cube",
     }
 
     cube_titles = {
         "combined": "Target to Reference (1-5 all)",
-        "primaries": f"Target to Reference (1-2 primaries: {tone_method})",
-        "white_balance": "Target to Reference (3 white balance)",
-        "color": "Target to Reference (4 color grading)",
+        "primaries": f"Target to Reference (1 primaries: {tone_method})",
+        "white_balance": "Target to Reference (2 white balance)",
+        "saturation": "Target to Reference (3 saturation)",
+        "color": "Target to Reference (4 color)",
         "skin": "Target to Reference (5 skin tone)",
     }
 
@@ -628,6 +722,14 @@ def run_tone_matching_pipeline(
             primaries_result["diagnostics"] if primaries_result else None
         ),
         "white_balance": white_balance,
+        "saturation": float(saturation),
+        "saturation_diagnostics": saturation_result["diagnostics"],
+        "saturation_nodes": saturation_nodes,
+        "saturation_strength": float(saturation_strength),
+        "skin_lightness_strength": float(skin_lightness_strength),
+        "reference_skin_lightness_target": reference_skin_lightness_target,
+        "skin_lightness_target": skin_lightness_target,
+        "target_balanced_rgb": target_balanced_rgb,
         "reference_skin": reference_skin,
         "reference_crop": reference_crop,
         "target_crop": target_crop,

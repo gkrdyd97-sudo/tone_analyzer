@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 from tone_analyzer.pipeline import run_tone_matching_pipeline
-from tone_analyzer.primaries import SAFE_LOWER, SAFE_UPPER, blend_primaries, estimate_primaries
+from tone_analyzer.primaries import SAFE_RANGES, estimate_primaries, limit_with_distrust
 
 
 def _scene(height, width, seed, dark_fraction=0.0):
@@ -24,45 +24,86 @@ def content_difference_pair():
     return target, reference
 
 
-def _vector(primaries):
-    return np.array([primaries["lift"], primaries["gamma"], primaries["gain"], primaries["contrast"]])
+def _black_white_mid(image):
+    from tone_analyzer.primaries import luma
+    values = luma(image.reshape(-1, 3).astype(float) / 255.0)
+    return np.percentile(values, [0.5, 50.0, 99.5])
 
 
-def test_wide_fit_overreacts_to_content_difference(content_difference_pair):
+def _graded(image, primaries):
+    from tone_analyzer.primaries import apply_primaries_to_image
+    return apply_primaries_to_image(image, primaries)
+
+
+def test_lift_gain_match_black_and_white_points():
+    # 같은 장면을 블랙을 띄우고 화이트를 낮춰 '바랜' 레퍼런스
+    target = _scene(240, 400, seed=0)
+    faded = np.clip(target.astype(float) * 0.8 + 20, 0, 255).astype(np.uint8)
+
+    result = estimate_primaries(target, faded)
+    out = _graded(target, result["primaries"])
+
+    reference_black, _, reference_white = _black_white_mid(faded)
+    out_black, _, out_white = _black_white_mid(out)
+    assert out_black == pytest.approx(reference_black, abs=0.01)
+    assert out_white == pytest.approx(reference_white, abs=0.01)
+    assert result["primaries"]["lift"] > 0          # 블랙을 띄움
+    assert len(result["diagnostics"]["lift_gain_history"]) >= 2   # 번갈아 보간
+
+
+def test_gamma_matches_median_with_black_white_fixed():
+    target = _scene(240, 400, seed=0)
+    # 미드톤만 밝은 레퍼런스 (블랙·화이트는 같음)
+    brighter_mids = (255 * (target / 255.0) ** 0.85).astype(np.uint8)
+
+    result = estimate_primaries(target, brighter_mids)
+    out = _graded(target, result["primaries"])
+
+    _, reference_mid, _ = _black_white_mid(brighter_mids)
+    _, out_mid, _ = _black_white_mid(out)
+    assert out_mid == pytest.approx(reference_mid, abs=0.01)
+    assert result["primaries"]["gamma"] > 1.0
+    assert result["diagnostics"]["limited"] == []
+
+
+def test_content_difference_is_distrusted_not_pinned(content_difference_pair):
     target, reference = content_difference_pair
-    result = estimate_primaries(target, reference, safe_limits=False)
-    values = _vector(result["primaries"])
-    # 내용 차이를 노출 차이로 착각해 안전 범위를 벗어나는 값이 나온다
-    assert np.any((values < SAFE_LOWER - 1e-3) | (values > SAFE_UPPER + 1e-3))
+    wide = estimate_primaries(target, reference, safe_limits=False)
+    safe = estimate_primaries(target, reference, safe_limits=True)
+
+    raw_gamma = wide["primaries"]["gamma"]
+    gamma = safe["primaries"]["gamma"]
+
+    assert not (SAFE_RANGES["gamma"][0] <= raw_gamma <= SAFE_RANGES["gamma"][1])
+    assert "gamma" in safe["diagnostics"]["limited"]
+    # 범위 끝에 붙이지 않고 그보다 원래 값(1) 쪽으로
+    assert SAFE_RANGES["gamma"][0] < gamma < SAFE_RANGES["gamma"][1]
 
 
-def test_safe_limits_keep_values_in_range_and_report(content_difference_pair):
-    target, reference = content_difference_pair
-    result = estimate_primaries(target, reference, safe_limits=True)
-    values = _vector(result["primaries"])
-
-    assert np.all(values >= SAFE_LOWER - 1e-6)
-    assert np.all(values <= SAFE_UPPER + 1e-6)
-    assert result["diagnostics"]["limited"]                      # 제한한 항목을 알려줌
-    raw = _vector(result["diagnostics"]["raw_primaries"])
-    assert np.any((raw < SAFE_LOWER - 1e-3) | (raw > SAFE_UPPER + 1e-3))
+def test_limit_with_distrust():
+    assert limit_with_distrust(1.1, 0.8, 1.25) == (pytest.approx(1.1), False)
+    value, limited = limit_with_distrust(1.51, 0.8, 1.25)
+    assert limited and 1.0 < value < 1.25
+    # 더 많이 벗어날수록 더 적게 적용
+    assert limit_with_distrust(3.0, 0.8, 1.25)[0] < value
 
 
 def test_strength_zero_is_identity():
-    primaries = {"lift": 0.03, "gamma": 0.8, "gain": 1.1, "contrast": 1.15, "pivot": 0.4}
-    neutral = blend_primaries(primaries, 0.0)
-    assert neutral["lift"] == 0.0
-    assert neutral["gamma"] == neutral["gain"] == neutral["contrast"] == 1.0
-
-    half = blend_primaries(primaries, 0.5)
-    assert half["gamma"] == pytest.approx(0.8 ** 0.5)
+    target = _scene(240, 400, seed=0)
+    reference = _scene(240, 400, seed=1, dark_fraction=0.4)
+    result = estimate_primaries(target, reference, strength=0.0)
+    out = _graded(target, result["primaries"])
+    assert np.abs(out.astype(int) - target.astype(int)).max() <= 1
 
 
 def test_same_image_needs_no_change():
     image = _scene(240, 400, seed=2)
     result = estimate_primaries(image, image)
-    assert result["primaries"]["gamma"] == pytest.approx(1.0, abs=0.02)
-    assert result["diagnostics"]["limited"] == []
+    primaries = result["primaries"]
+    assert primaries["lift"] == pytest.approx(0.0, abs=0.005)
+    assert primaries["gain"] == pytest.approx(1.0, abs=0.01)
+    assert primaries["gamma"] == pytest.approx(1.0, abs=0.02)
+    assert primaries["contrast"] == pytest.approx(1.0, abs=0.03)
 
 
 # ── 파이프라인 ─────────────────────────────
@@ -125,3 +166,24 @@ def test_skin_target_defaults_to_reference_mode(letterboxed_files):
 def test_unknown_match_mode_raises(letterboxed_files):
     with pytest.raises(ValueError):
         _run(letterboxed_files, match_mode="nope")
+
+
+def test_five_nodes_chain_equals_combined(letterboxed_files):
+    from tone_analyzer.lut import apply_3d_lut_to_pixels, load_cube_file
+
+    result = _run(letterboxed_files)
+    paths = result["cube_paths"]
+    assert set(paths) == {"combined", "primaries", "white_balance", "saturation", "color", "skin"}
+    assert paths["saturation"].endswith("_3_sat.cube") and paths["skin"].endswith("_5_skin.cube")
+
+    pixels = np.random.default_rng(0).random((2000, 3)).astype(np.float32)
+    chained = pixels
+    for key in ("primaries", "white_balance", "saturation", "color", "skin"):
+        lut, size = load_cube_file(paths[key])
+        chained = apply_3d_lut_to_pixels(chained, lut, size)
+
+    combined, size = load_cube_file(paths["combined"])
+    direct = apply_3d_lut_to_pixels(pixels, combined, size)
+
+    # 9³ 격자라 보간 오차는 있지만 평균 1% 안
+    assert np.abs(chained - direct).mean() < 0.01

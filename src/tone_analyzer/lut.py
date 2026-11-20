@@ -598,3 +598,46 @@ def compose_with_tone_stage(
         lut_output=color_lut_output,
         lut_size=lut_size,
     )
+
+
+def load_cube_file(path):
+    """
+    .cube 파일을 읽어 (lut_output, lut_size) 로 돌려준다.
+    lut_output 은 이 프로젝트 내부 순서([R][G][B], B 가 가장 빨리 변함)로 바꿔서 돌려준다.
+    """
+
+    path = Path(path)
+    lut_size = None
+    rows = []
+
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+
+        if not line or line.startswith("#"):
+            continue
+
+        if line.startswith("LUT_3D_SIZE"):
+            lut_size = int(line.split()[1])
+            continue
+
+        if line[0].isalpha():
+            continue
+
+        rows.append([float(value) for value in line.split()])
+
+    if lut_size is None:
+        raise ValueError("LUT_3D_SIZE 가 없습니다.")
+
+    data = np.asarray(rows, dtype=np.float32)
+
+    if len(data) != lut_size ** 3:
+        raise ValueError("데이터 줄 수가 LUT_3D_SIZE 와 맞지 않습니다.")
+
+    lut_output = (
+        data
+        .reshape(lut_size, lut_size, lut_size, 3)
+        .transpose(2, 1, 0, 3)
+        .reshape(-1, 3)
+    )
+
+    return lut_output, lut_size

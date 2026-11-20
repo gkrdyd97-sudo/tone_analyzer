@@ -156,8 +156,12 @@ def transfer_color_reinhard(
         r_mean = reference_lab[:, channel].mean()
         r_std = reference_lab[:, channel].std()
 
+        std_ratio = r_std / t_std
+        if channel != 0:
+            std_ratio = std_ratio ** CHROMA_STD_EXPONENT
+
         result_lab[:, channel] = (
-            (target_lab[:, channel] - t_mean) * (r_std / t_std) + r_mean
+            (target_lab[:, channel] - t_mean) * std_ratio + r_mean
         )
 
     return _lab_to_rgb(result_lab).astype(np.float32)
@@ -245,6 +249,11 @@ def _weighted_mean_std(values, weights):
     return mean, np.sqrt(variance)
 
 
+# ④ 색작업에서 채도(분산) 배율을 얼마나 따를지. 채도는 ③ 단계가 맡으므로 약하게(제곱근).
+# 1 이면 Reinhard 원래대로 분산까지 완전히 맞춘다.
+CHROMA_STD_EXPONENT = 0.5
+
+
 def transfer_color_reinhard_tonal(
     target_samples,
     reference_samples,
@@ -292,6 +301,9 @@ def transfer_color_reinhard_tonal(
                 min_std_ratio,
                 max_std_ratio,
             )
+
+            if channel != 0:
+                std_ratio = std_ratio ** CHROMA_STD_EXPONENT
 
             region_result = (
                 (target_lab[:, channel] - t_mean) * std_ratio + r_mean
