@@ -133,6 +133,34 @@ def _unpack(vector, pivot):
     return primaries
 
 
+# 추정 허용 범위
+#                       lift   gamma  gain  contrast
+WIDE_LOWER = np.array([-0.15, 0.3,   0.3,  0.5])
+WIDE_UPPER = np.array([0.3,   3.0,   2.5,  2.0])
+
+# 안전 범위: 두 이미지의 '내용 차이'(검은 옷이 많은 레퍼런스 등)를 노출 차이로
+# 착각해 계조를 크게 비트는 것을 막는다. 실제 노출 차이는 카메라 앱에서는 EV(센서)로 처리.
+SAFE_LOWER = np.array([-0.04, 0.8,  0.85, 0.85])
+SAFE_UPPER = np.array([0.04,  1.25, 1.15, 1.2])
+
+
+def blend_primaries(primaries, strength):
+    """
+    ①② 강도. 0 = 변화 없음, 1 = 추정값 그대로.
+    곱하는 값(gamma, gain, contrast)은 지수로, 더하는 값(lift)은 선형으로 섞는다.
+    """
+
+    strength = float(np.clip(strength, 0.0, 1.0))
+
+    return {
+        "lift": float(primaries["lift"]) * strength,
+        "gamma": float(primaries["gamma"]) ** strength,
+        "gain": float(primaries["gain"]) ** strength,
+        "contrast": float(primaries["contrast"]) ** strength,
+        "pivot": float(primaries["pivot"]),
+    }
+
+
 def estimate_primaries(
     target_rgb,
     reference_rgb,
@@ -140,6 +168,8 @@ def estimate_primaries(
     regularization=0.05,
     separation_ratio=0.4,
     random_seed=42,
+    safe_limits=True,
+    strength=1.0,
 ):
     """
     Target -> Reference 의 ① LGG, ② Contrast/Pivot 값을 추정한다.
@@ -153,11 +183,15 @@ def estimate_primaries(
     Pivot 은 Reference 의 중간 밝기(루마 중앙값)로 고정한다.
     (대비를 조절해도 '레퍼런스의 중간톤 위치'는 유지되도록)
 
+    safe_limits : True 면 SAFE 범위 안에서만 맞춘다.
+        범위 밖이 필요했다면(= 넓은 범위로 맞춘 값이 SAFE 밖) diagnostics["limited"] 에 표시.
+    strength : ①② 강도 0~1 (blend_primaries)
+
     Returns
     -------
     dict
-        primaries   : {"lift", "gamma", "gain", "contrast", "pivot"}
-        diagnostics : 맞추기 전/후 루마 분위수
+        primaries   : {"lift", "gamma", "gain", "contrast", "pivot"}  (안전 범위·강도 적용 후)
+        diagnostics : 맞추기 전/후 루마 분위수, 넓은 범위 추정값(raw_primaries), 제한 여부
     """
 
     validate_rgb_image(target_rgb)
@@ -215,19 +249,33 @@ def estimate_primaries(
             separation_residual,
         ])
 
-    #                 lift  gamma  gain  contrast
-    lower = np.array([-0.15, 0.3,   0.3,  0.5])
-    upper = np.array([0.3,  3.0,   2.5,  2.0])
+    def solve(lower, upper):
+        return least_squares(
+            residuals,
+            np.clip(neutral_vector, lower, upper),
+            bounds=(lower, upper),
+            diff_step=1e-4,
+            max_nfev=300,
+        )
 
-    solution = least_squares(
-        residuals,
-        neutral_vector,
-        bounds=(lower, upper),
-        diff_step=1e-4,
-        max_nfev=300,
-    )
+    wide_solution = solve(WIDE_LOWER, WIDE_UPPER)
+    raw_primaries = _unpack(wide_solution.x, pivot)
 
-    primaries = _unpack(solution.x, pivot)
+    if safe_limits:
+        lower, upper = SAFE_LOWER, SAFE_UPPER
+        solution = solve(lower, upper)
+    else:
+        lower, upper = WIDE_LOWER, WIDE_UPPER
+        solution = wide_solution
+
+    # 넓은 범위 추정값이 안전 범위를 벗어난 항목 = 제한된 항목
+    limited = [
+        name
+        for name, value, low, high in zip(PARAMETER_ORDER, wide_solution.x, SAFE_LOWER, SAFE_UPPER)
+        if value < low - 1e-3 or value > high + 1e-3
+    ] if safe_limits else []
+
+    primaries = blend_primaries(_unpack(solution.x, pivot), strength)
 
     at_bounds = [
         name
@@ -248,6 +296,10 @@ def estimate_primaries(
             LUMA_QUANTILES,
         ).tolist(),
         "parameters_at_bounds": at_bounds,
+        "raw_primaries": raw_primaries,
+        "safe_limits": bool(safe_limits),
+        "limited": limited,
+        "strength": float(np.clip(strength, 0.0, 1.0)),
         "optimizer_cost": float(solution.cost),
         "optimizer_success": bool(solution.success),
     }

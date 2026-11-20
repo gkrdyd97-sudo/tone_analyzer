@@ -44,3 +44,5 @@ images/
 # AI coding assistant skills (local symlinks into .venv)
 .claude/
 .agents/
+
+.pytest_cache/

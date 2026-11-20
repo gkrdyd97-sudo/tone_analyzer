@@ -503,11 +503,13 @@ MIN_RELIABLE_SKIN_CHROMA = 6.0
 def is_reliable_skin(skin_info):
     """
     측정한 피부가 목표로 쓸 만한지.
-    얼굴이 너무 어둡거나(후드, 역광) 무채색에 가까우면 색상각을 믿을 수 없다.
+    얼굴에서 잰 것이 아니거나, 얼굴이 너무 어둡거나(후드, 역광) 무채색에 가까우면 색상각을 믿을 수 없다.
     """
 
+    # 얼굴에서 잰 피부만 믿는다. 색 기준 추정(얼굴 없음)은 나무·벽일 수 있다.
     return (
         skin_info is not None
+        and skin_info.get("source", "face") == "face"
         and skin_info.get("hue") is not None
         and (skin_info.get("chroma") or 0.0) >= MIN_RELIABLE_SKIN_CHROMA
     )

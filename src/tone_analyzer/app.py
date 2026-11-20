@@ -124,6 +124,30 @@ st.sidebar.caption(
 )
 
 
+match_mode = st.sidebar.radio(
+    "매칭 방식",
+    options=["look", "same_scene"],
+    format_func=lambda value: {
+        "look": "다른 장면의 룩 옮기기",
+        "same_scene": "같은 장면의 컷 맞추기",
+    }[value],
+    help=(
+        "룩 옮기기: 다른 장소·장면에 레퍼런스의 룩을 입힙니다 (카메라 앱과 같은 방식).\n"
+        "컷 맞추기: 같은 장면을 반대편에서 찍은 컷(리버스 숏)처럼 이미 같은 노출·그레이딩인 두 컷을 맞춥니다. "
+        "밝기 분포 차이는 화면 내용 차이이므로 ①② 를 끄고, ③ 은 Reference 중성색에 맞춥니다."
+    ),
+)
+
+same_scene = match_mode == "same_scene"
+
+
+auto_crop = st.sidebar.checkbox(
+    "레터박스 자동 제거",
+    value=True,
+    help="위아래·좌우의 검은 띠를 찾아 잘라낸 뒤 분석합니다. 검은 띠가 '블랙'으로 계산되어 섀도우가 틀어지는 것을 막습니다.",
+)
+
+
 tone_method = st.sidebar.selectbox(
     "톤 단계 방식",
     options=["primaries", "histogram"],
@@ -135,9 +159,34 @@ tone_method = st.sidebar.selectbox(
 )
 
 
+tone_safe_limits = st.sidebar.checkbox(
+    "①② 안전 범위",
+    value=True,
+    disabled=same_scene,
+    help=(
+        "Gamma 0.8~1.25, Gain 0.85~1.15, Lift ±0.04, Contrast 0.85~1.2 안에서만 맞춥니다. "
+        "두 이미지의 '내용 차이'(검은 옷이 많은 레퍼런스 등)를 노출 차이로 착각해 계조를 크게 비트는 것을 막습니다. "
+        "실제로 노출이 크게 다른 사진을 맞출 때만 끄세요."
+    ),
+)
+
+
+tone_strength = st.sidebar.slider(
+    "①② 강도",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.0 if same_scene else 1.0,
+    step=0.05,
+    disabled=same_scene,
+    help="0 이면 밝기·대비를 건드리지 않습니다. (같은 장면 컷 맞추기에서는 0 고정)",
+)
+
+
 white_balance_mode = st.sidebar.radio(
     "③ 화이트밸런스 기준",
     options=["neutral", "reference"],
+    index=1 if same_scene else 0,
+    disabled=same_scene,
     format_func=lambda value: {
         "neutral": "중성색을 회색으로 (밸런스 보정)",
         "reference": "Reference 의 중성색에 맞춤",
@@ -244,13 +293,13 @@ st.sidebar.subheader(
 
 skin_target_mode = st.sidebar.radio(
     "교정 목표",
-    options=["line", "reference"],
+    options=["reference", "line"],
     format_func=lambda value: {
+        "reference": "Reference 속 피부 색 (영화의 피부 톤)",
         "line": "스킨톤 라인 (벡터스코프 I 라인)",
-        "reference": "Reference 속 피부 색",
     }[value],
     help=(
-        "Reference 에 피부가 충분히 없으면 스킨톤 라인을 사용합니다."
+        "Reference 피부를 믿을 수 없으면(얼굴 없음, 너무 어둡거나 무채색) 스킨톤 라인을 사용합니다."
     ),
 )
 
@@ -442,6 +491,10 @@ if run_button:
                     tone_method=tone_method,
                     balance_strength=balance_strength,
                     white_balance_mode=white_balance_mode,
+                    auto_crop=auto_crop,
+                    tone_strength=tone_strength,
+                    tone_safe_limits=tone_safe_limits,
+                    match_mode=match_mode,
                 )
             )
 
@@ -578,6 +631,34 @@ if session_result is not None:
         f"{pipeline_result['mean_absolute_error_8bit']:.2f}",
         help="LUT가 색 전이 결과를 얼마나 잘 따라가는지 (낮을수록 좋음)",
     )
+
+    def describe_crop(label, crop):
+        if not crop or crop["confidence"] == "none":
+            return f"{label}: 검은 띠 없음"
+        sides = [
+            f"{name} {crop[key]}px"
+            for key, name in (("top", "위"), ("bottom", "아래"), ("left", "왼쪽"), ("right", "오른쪽"))
+            if crop[key]
+        ]
+        aspect = f", {crop['aspect_name']}" if crop.get("aspect_match") else ""
+        return f"{label}: {' · '.join(sides)} 제거 → {crop['width']}×{crop['height']}{aspect}"
+
+    if pipeline_result.get("reference_crop") or pipeline_result.get("target_crop"):
+        st.caption(
+            "레터박스 — "
+            + describe_crop("Reference", pipeline_result.get("reference_crop"))
+            + " / "
+            + describe_crop("Target", pipeline_result.get("target_crop"))
+        )
+        for label, crop in (
+            ("Reference", pipeline_result.get("reference_crop")),
+            ("Target", pipeline_result.get("target_crop")),
+        ):
+            for message in (crop or {}).get("warnings", []):
+                st.warning(f"{label} 레터박스: {message}")
+
+    if pipeline_result.get("match_mode") == "same_scene":
+        st.caption("같은 장면의 컷 맞추기: ①② 끔, ③ Reference 중성색에 맞춤")
 
     target_skin_info = pipeline_result.get("target_skin") or {}
 
@@ -810,7 +891,19 @@ if session_result is not None:
                 width="stretch",
             )
 
-            if diagnostics.get("parameters_at_bounds"):
+            if diagnostics.get("limited") and pipeline_result.get("tone_strength", 1.0) > 0:
+                raw = diagnostics.get("raw_primaries") or {}
+                st.warning(
+                    "①② 안전 범위로 제한한 값: "
+                    + ", ".join(
+                        f"{name} ({raw.get(name, float('nan')):.2f} → 제한)"
+                        for name in diagnostics["limited"]
+                    )
+                    + ". 두 이미지의 밝기 분포 차이가 커서, 화면 내용 차이(검은 옷·그림자 비율 등)를 "
+                    "노출 차이로 잘못 읽었을 가능성이 높습니다. 같은 장면의 컷이면 '같은 장면의 컷 맞추기'를, "
+                    "실제로 노출이 크게 다르면 '①② 안전 범위'를 끄세요."
+                )
+            elif diagnostics.get("parameters_at_bounds") and not diagnostics.get("safe_limits"):
                 st.warning(
                     "허용 범위 끝에 닿은 값: "
                     + ", ".join(diagnostics["parameters_at_bounds"])

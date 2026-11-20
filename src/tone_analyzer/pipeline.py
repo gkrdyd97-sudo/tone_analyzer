@@ -39,6 +39,8 @@ from .primaries import (
 
 from .lut import apply_3d_lut_to_pixels
 
+from .letterbox import remove_letterbox
+
 from .skin_tone import (
     SKIN_LINE_HUE,
     build_skin_correction_lut,
@@ -239,13 +241,27 @@ def run_tone_matching_pipeline(
     tone_method="primaries",
     balance_strength=0.7,
     white_balance_mode="neutral",
-    skin_target_mode="line",
+    skin_target_mode="reference",
     skin_hue_strength=0.5,
     skin_saturation=1.0,
     skin_without_face=False,
+    auto_crop=True,
+    tone_strength=1.0,
+    tone_safe_limits=True,
+    match_mode="look",
 ):
     """
     전체 톤 매칭 파이프라인.
+
+    match_mode
+    ----------
+    "look"       (기본) : 다른 장면의 룩을 옮긴다. ①② 는 안전 범위 안에서만.
+    "same_scene"        : 같은 장면의 다른 컷 맞추기(리버스 숏 등).
+                          두 컷은 이미 같은 노출·그레이딩이라 밝기 분포 차이는 '내용 차이'다.
+                          → ①② 끔(tone_strength=0), ③ 은 Reference 중성색에 맞춤(강도 1).
+
+    auto_crop : 레퍼런스·타깃의 레터박스/필러박스를 잘라내고 분석한다. (결과 이미지도 잘린 크기)
+    tone_strength / tone_safe_limits : ①② 강도와 안전 범위 (primaries.estimate_primaries)
 
     순서 (컬러리스트 작업 순서 / DaVinci 노드 구조)
     ---------------------------------------------
@@ -284,6 +300,20 @@ def run_tone_matching_pipeline(
 
     reference_rgb = load_rgb_image(reference_path)
     target_rgb = load_rgb_image(target_path)
+
+    if match_mode == "same_scene":
+        tone_strength = 0.0
+        white_balance_mode = "reference"
+        balance_strength = 1.0
+    elif match_mode != "look":
+        raise ValueError("match_mode 는 'look' 또는 'same_scene' 이어야 합니다.")
+
+    # 0. 레터박스 제거 (검은 띠가 '블랙'으로 통계에 섞이지 않도록)
+    reference_crop = target_crop = None
+
+    if auto_crop:
+        reference_rgb, reference_crop = remove_letterbox(reference_rgb)
+        target_rgb, target_crop = remove_letterbox(target_rgb)
 
 
     # 2. 밝기 분석
@@ -331,6 +361,8 @@ def run_tone_matching_pipeline(
         primaries_result = estimate_primaries(
             target_rgb=target_rgb,
             reference_rgb=reference_rgb,
+            safe_limits=tone_safe_limits,
+            strength=tone_strength,
         )
 
         primaries = primaries_result["primaries"]
@@ -340,8 +372,11 @@ def run_tone_matching_pipeline(
 
     elif tone_method == "histogram":
 
+        curve_strength = float(np.clip(tone_strength, 0.0, 1.0))
+
         def primaries_stage(pixels):
-            return apply_tone_curve_to_pixels(pixels, tone_curve)
+            curved = np.asarray(apply_tone_curve_to_pixels(pixels, tone_curve))
+            return np.asarray(pixels) * (1.0 - curve_strength) + curved * curve_strength
 
     else:
         raise ValueError(
@@ -594,6 +629,11 @@ def run_tone_matching_pipeline(
         ),
         "white_balance": white_balance,
         "reference_skin": reference_skin,
+        "reference_crop": reference_crop,
+        "target_crop": target_crop,
+        "match_mode": match_mode,
+        "tone_strength": float(tone_strength),
+        "tone_safe_limits": bool(tone_safe_limits),
         "target_skin": target_skin,
         "target_skin_samples": target_skin_samples,
         "target_skin_color_samples": target_skin_color_samples,
